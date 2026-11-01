@@ -2,6 +2,8 @@
 
 一个 **DeepSeek Harness 插件**，把 TTS 语音合成做进 DSH 里：小米 MiMo / Breeze 双协议、预设音色 / 音色设计 / 语音克隆、唱歌、自定义请求模板、参考音频管理，合成后可直接发 QQ 语音。
 
+> **本插件全程由 AI 制作，如有 BUG，自行用 AI 修复。**
+
 装好之后你会得到三样东西：
 
 | 面 | 内容 |
@@ -443,7 +445,7 @@ node bin/install.mjs --pack [输出目录]   # 打 zip，默认到桌面
 | 自测 | 两个测试文件 | **77 passed / 0 failed**（render-smoke 0 failed） |
 | 元数据 | `node bin/install.mjs --check` | 校验通过 |
 
-复核的实测结果：22 个文件；真实密钥前缀、本机用户目录、克隆音频文件名、长 base64 片段全部无命中；BOM 0 个；插件目录下 **Low 标签 0 项**；zip 本身是 `Medium Mandatory Level`。命中的只有四类误报，均属文档/占位符：`192.0.2.10` 与 `203.0.113.7`（RFC 5737 文档专用段）、`123456789` 占位符、`maxBytes: 20971520` 这类配置数值被「长数字串」正则撞到、本清单里作为检查项写出的 `debugger` 字样。
+复核的实测结果：23 个文件；真实密钥前缀、本机用户目录、克隆音频文件名、长 base64 片段全部无命中；BOM 0 个；插件目录下 **Low 标签 0 项**；zip 本身是 `Medium Mandatory Level`。命中的只有四类误报，均属文档/占位符：`192.0.2.10` 与 `203.0.113.7`（RFC 5737 文档专用段）、`123456789` 占位符、`maxBytes: 20971520` 这类配置数值被「长数字串」正则撞到、本清单里作为检查项写出的 `debugger` 字样。
 
 ### 关于文件完整性级别（Windows）
 
@@ -478,6 +480,7 @@ dsh-plugin-tts/
 │   └── logger.js         # 内存 ring + 文件日志
 ├── locale/{zh,en}.json   # 插件元数据
 ├── icon.svg
+├── LICENSE               # MIT
 ├── bin/install.mjs
 └── test/
     ├── standalone.test.mjs
@@ -543,5 +546,5 @@ dsh-plugin-tts/
 
 - `node test/standalone.test.mjs` → 77 passed, 0 failed
 - `node test/render-smoke.mjs` → 0 failed
-- 22 个文件，零 npm 依赖
+- 23 个文件，零 npm 依赖
 ````
