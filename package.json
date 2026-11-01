@@ -1,0 +1,63 @@
+{
+  "name": "dsh-plugin-tts",
+  "version": "0.4.2",
+  "description": "DeepSeek Harness 的 TTS 语音合成插件：小米 MiMo / Breeze 双协议合成、试听、克隆音色、唱歌，并可直接通过 OneBot 发 QQ 语音。",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "bin",
+    "test",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "tts",
+    "text-to-speech",
+    "voice",
+    "mimo",
+    "breeze",
+    "onebot",
+    "qq"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "meta": {
+    "title": "TTS 语音合成",
+    "description": "合成语音（小米 MiMo / Breeze）、试听、克隆音色、唱歌，并可把语音作为 QQ 语音发给群或好友。"
+  },
+  "scripts": {
+    "test": "node test/standalone.test.mjs && node test/render-smoke.mjs"
+  },
+  "license": "MIT"
+}

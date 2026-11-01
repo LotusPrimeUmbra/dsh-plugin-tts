@@ -1,0 +1,54 @@
+{
+  "ok": true,
+  "enabled": true,
+  "aiEnabled": true,
+  "hasApiKey": true,
+  "apiKeyHint": "sk-****mock",
+  "apiStyle": "openai",
+  "routeMode": "smart",
+  "routeModeEffective": "smart",
+  "routeReady": {
+    "mimo": true,
+    "breeze": true
+  },
+  "model": "mimo-v2.5-tts-voiceclone",
+  "mode": "clone",
+  "voice": "（克隆音色）",
+  "format": "wav",
+  "maxChars": 2000,
+  "onebot": {
+    "httpUrl": "http://127.0.0.1:3000",
+    "tokenSet": true,
+    "source": "plugin-config"
+  },
+  "cloneReady": true,
+  "configPath": "C:\\Users\\tester\\.dsh\\dsh-tts\\config.json",
+  "log": [
+    {
+      "at": 1793323690994,
+      "kind": "info",
+      "message": "TTS 插件已挂载：home=C:\\Users\\tester\\.dsh enabled=true model=mimo-v2.5-tts-voiceclone mode=clone"
+    },
+    {
+      "at": 1793324552220,
+      "kind": "info",
+      "message": "试听成功：15 字 / 3088ms / breeze"
+    }
+  ],
+  "routeReadyDetail": {
+    "mimo": {
+      "baseUrl": true,
+      "apiKey": true,
+      "model": true,
+      "missing": [],
+      "ready": true
+    },
+    "breeze": {
+      "baseUrl": true,
+      "apiKey": true,
+      "model": true,
+      "missing": [],
+      "ready": true
+    }
+  }
+}
