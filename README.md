@@ -445,15 +445,19 @@ node bin/install.mjs --pack [输出目录]   # 打 zip，默认到桌面
 | 残留临时文件 | 目录树里搜 `_probe*`、`*.tmp`、`*.bak`、`*.log`、`node_modules` | 无 |
 | 硬编码密钥 | 搜 `brz_`、`sk-`、`apiKey:` 的长字面量 | 只有测试用的 `sk-test-…` 这类明显假值 |
 | 本机痕迹 | 搜 `C:\Users\<你的用户名>`、真实内网 IP | 无 |
-| 参考音频痕迹 | 搜 `clone-*.wav`、长 base64 片段 | 无（fixture 里是 `clone-mock.wav`） |
+| 参考音频痕迹 | 搜 `clone-*.wav`、长 base64 片段 | 只有空字节占位文件，无真实音频内容；长 base64 片段无 |
 | 真实 QQ 号 | 搜 9~11 位纯数字 | 只有 `123456789` 这类占位符 |
 | 调试代码 | 搜 `debugger`、非测试文件里的 `console.log` | 无 |
-| 文件编码 | 全部 UTF-8 无 BOM | 通过 |
+| 文件编码 | 全部 UTF-8 无 BOM，换行统一 LF（`package.json` 也不例外） | 通过 |
 | 完整性级别 | `icacls <目录>` 不应出现 `Low Mandatory Level` | 全部 Medium |
 | 自测 | 两个测试文件 | **77 passed / 0 failed**（render-smoke 0 failed） |
 | 元数据 | `node bin/install.mjs --check` | 校验通过 |
 
-复核的实测结果：23 个文件；真实密钥前缀、本机用户目录、克隆音频文件名、长 base64 片段全部无命中；BOM 0 个；插件目录下 **Low 标签 0 项**；zip 本身是 `Medium Mandatory Level`。命中的只有四类误报，均属文档/占位符：`192.0.2.10` 与 `203.0.113.7`（RFC 5737 文档专用段）、`123456789` 占位符、`maxBytes: 20971520` 这类配置数值被「长数字串」正则撞到、本清单里作为检查项写出的 `debugger` 字样。
+复核的实测结果：23 个文件；真实密钥前缀、本机用户目录、长 base64 片段全部无命中；BOM 0 个、CR 0 个（全 LF）；插件目录下 **Low 标签 0 项**；zip 本身是 `Medium Mandatory Level`。
+
+`clone-*.wav` 是**唯一的例外**：`test/fixtures/config.json` 里写着 `clone-mock.wav`，`test/standalone.test.mjs` 里用 `clone-test.wav` / `clone-short.wav` / `clone-legacy.wav` 三个名字配合 `Buffer.alloc(64)` 或现场合成的 WAV 做断言。这些都是空字节占位或测试内生成的波形，**不含任何真实录音**，随包公开无风险。
+
+命中的其余项均属文档/占位符误报：`192.0.2.10` 与 `203.0.113.7`（RFC 5737 文档专用段）、`123456789` 占位符、`maxBytes: 20971520` 这类配置数值被「长数字串」正则撞到、本清单里作为检查项写出的 `debugger` 字样、`bin/install.mjs:43` 的 `console.log(text)`（CLI 输出函数 `line()`，不是调试残留）。
 
 ### 关于文件完整性级别（Windows）
 
