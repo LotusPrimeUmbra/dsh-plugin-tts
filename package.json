@@ -27,16 +27,25 @@
     "LICENSE"
   ],
   "keywords": [
-    "dsh",
-    "deepseek-harness",
     "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "dsh",
     "tts",
     "text-to-speech",
-    "voice",
-    "mimo",
+    "speech-synthesis",
+    "voice-cloning",
+    "voice-clone",
+    "ai-voice",
+    "singing-synthesis",
+    "voice-design",
+    "xiaomi-mimo",
     "breeze",
     "onebot",
-    "qq"
+    "qq-bot",
+    "qq",
+    "nodejs",
+    "openai-compatible"
   ],
   "engines": {
     "node": ">=22.19.0"
