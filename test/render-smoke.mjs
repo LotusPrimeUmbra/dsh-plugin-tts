@@ -290,8 +290,29 @@ const shortRef = await runOnce("openai", {
 const shortHtml = (await shortRef.render()).html;
 check(shortHtml.includes("参考音频过短"), "有效语音过短时面板常驻「参考音频过短」警告");
 check(shortHtml.includes("2.4") || shortHtml.includes("2.3"), "警告里带上量出的有效语音秒数");
-check(shortHtml.includes("10~30 秒"), "警告里给出「建议 10~30 秒」的具体动作");
-check(shortHtml.includes("超过 30 秒会自动截取"), "警告里说明超长会自动截断");
+check(shortHtml.includes("15~60 秒"), "警告里给出「建议 15~60 秒」的具体动作");
+// 0.4.3 起官方只限 Base64 ≤10MB，插件自己把参考音频截到 15~60 秒（长一点克隆更准）。
+check(!shortHtml.includes("超过 30 秒会自动截取"), "警告里不再宣称「超过 30 秒自动截断」");
+check(shortHtml.includes("10 MB"), "参考音频说明里标注 Base64 上限 10 MB");
+check(shortHtml.includes("自动截取到 15~60 秒"), "参考音频说明里标注自动截取 15~60 秒");
+check(!shortHtml.includes("唱歌参考已上传"), "旧版「唱歌参考」上传入口已移除");
+check(shortHtml.includes("请求头 / 请求体模板（高级）"), "请求模板区块还在（唱歌小节默认折叠在里面）");
+// 用户 m02175：pcm / pcm16 是裸流，不是能直接播放的格式，下拉里只留 wav / mp3。
+check(!shortHtml.includes("pcm16"), "格式下拉里不再出现 pcm16");
+check(!/>pcm<\/option>/.test(shortHtml), "格式下拉里不再出现 pcm");
+// 用户 m01689：翻唱不单独占卡片，改成「合成模式」里的一页；试听卡片里不再有翻唱试听。
+check(shortHtml.includes("翻唱合成"), "「合成模式」里有「翻唱合成」这一页");
+check(!shortHtml.includes("翻唱试听"), "试听卡片里不再有「翻唱试听」入口");
+const coverTabBtn = findButton((await shortRef.render()).nodes, "翻唱合成");
+check(Boolean(coverTabBtn), "「翻唱合成」是可点的 tab");
+if (coverTabBtn) await coverTabBtn.props.onClick();
+const coverHtml = (await shortRef.render()).html;
+check(coverHtml.includes("生成翻唱"), "翻唱页有「生成翻唱」按钮");
+check(coverHtml.includes("搜歌词"), "翻唱页有「搜歌词」按钮（不用手贴歌词）");
+check(coverHtml.includes("选择伴奏"), "翻唱页的伴奏入口还在");
+// 翻唱页能选模型 / 音色，并标明只有 mimo-v2.5-tts 支持唱歌。
+check(coverHtml.includes("（支持唱歌）"), "翻唱页的模型下拉标出哪些模型支持唱歌");
+check(coverHtml.includes("（不支持唱歌）"), "翻唱页的模型下拉标出哪些模型不支持唱歌");
 
 // 达标时不该出现这条警告（否则天天红着，用户就学会无视了）
 const goodRef = await runOnce("openai", {

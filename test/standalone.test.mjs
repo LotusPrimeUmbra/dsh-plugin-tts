@@ -20,7 +20,7 @@ import {
   saveSettings,
 } from '../lib/config.js'
 import { registerRoutes } from '../lib/routes.js'
-import { registerTools } from '../lib/tools.js'
+import { clipLyrics, registerTools } from '../lib/tools.js'
 import {
   actionUrl,
   budgetCheck,
@@ -42,18 +42,27 @@ import {
   targetToParams,
 } from '../lib/onebot.js'
 import {
+  CLONE_MAX_REF_SECONDS,
+  CLONE_MIN_REF_SECONDS,
   OFFICIAL_MODELS,
   PRESET_VOICES,
+  buildVars,
   describeTtsConfig,
   guessModeForModel,
+  hasSingTag,
   measureWavSpeech,
   mimeFromFormat,
+  openaiChatUrl,
+  readRouteLatency,
   reconcileModeModel,
   resolveRouteStyle,
   resolveVoiceValue,
   saveRefAudio,
+  stripSingTag,
+  synthesize,
   ttsCfg,
 } from '../lib/tts-lib.js'
+import { cleanLrc } from '../lib/lyrics.js'
 
 /* ------------------------------------------------------------------ harness */
 
@@ -142,12 +151,16 @@ await test('注册了全部 /dsh-tts 路由且形状合法', () => {
     '/dsh-tts/clear-ref',
     '/dsh-tts/ref-backup',
     '/dsh-tts/fetch-audio',
+    '/dsh-tts/lyrics',
     '/dsh-tts/speak',
     '/dsh-tts/ping',
     '/dsh-tts/import',
     '/dsh-tts/log',
   ]
   for (const pathname of expected) assert.ok(routes.has(pathname), `缺少路由 ${pathname}`)
+  // 反查：只查「expected 都在」的话，漏登记的路由（早先就漏了 /dsh-tts/lyrics）
+  // 永远不会被测出来。数量对齐才能真正锁住注册面。
+  assert.equal(routes.size, expected.length, `路由数应为 ${expected.length}，实际 ${routes.size}`)
 })
 
 await test('GET /state 返回插件状态', async () => {
@@ -310,6 +323,36 @@ await test('POST /config 的 onebot 补丁不会误清空 token', async () => {
   await req('POST', '/dsh-tts/config', { body: { onebot: { accessToken: '' } } })
 })
 
+/* ------------------------------------------- 参考音频接口的入参校验 */
+
+await test('POST /clone 拒绝非法 Base64 与非法 kind（不落盘）', async () => {
+  const bad64 = await req('POST', '/dsh-tts/clone', { body: { fileName: 'x.wav', dataBase64: '!!!not base64!!!', kind: 'clone' } })
+  assert.equal(bad64.status, 400)
+  assert.match(bad64.payload.error, /不是合法的 Base64/)
+  const badKind = await req('POST', '/dsh-tts/clone', { body: { fileName: 'x.wav', dataBase64: 'AAAA', kind: 'singing' } })
+  assert.equal(badKind.status, 400)
+  assert.match(badKind.payload.error, /kind 只能是 clone 或 sing/)
+})
+
+await test('POST /clear-ref 与 /ref-backup 拒绝非法 kind / action', async () => {
+  const clear = await req('POST', '/dsh-tts/clear-ref', { body: { kind: 'bogus' } })
+  assert.equal(clear.status, 400, '非法 kind 不该被当成 clone 去删参考音频')
+  const backup = await req('POST', '/dsh-tts/ref-backup', { body: { kind: 'clone', action: 'delete-all' } })
+  assert.equal(backup.status, 400)
+})
+
+await test('保存 .wave 参考音频时 MIME 是 audio/wav', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tts-wave-'))
+  try {
+    const cfg = ttsCfg({}, { rootDir })
+    const saved = saveRefAudio(cfg, { buffer: Buffer.from(silentWavBase64(6.5), 'base64'), fileName: 'ref.wave' })
+    assert.equal(saved.mimeType, 'audio/wav', '.wave 也要能用 <audio> 播放')
+    assert.ok(saved.fileName.endsWith('.wave'))
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true })
+  }
+})
+
 await test('GET /log 返回最近日志数组', async () => {
   const { status, payload } = await req('GET', '/dsh-tts/log')
   assert.equal(status, 200)
@@ -359,12 +402,27 @@ await test('registerTools 注册 tts_speak 与 tts_voices', () => {
   const speakDef = defs.find((d) => d.name === 'tts_speak')
   const voicesDef = defs.find((d) => d.name === 'tts_voices')
   assert.ok(speakDef && voicesDef)
-  assert.deepEqual(speakDef.parameters.required, ['text'])
+  assert.deepEqual(speakDef.parameters.required, [])
+  assert.ok(speakDef.parameters.properties.song, '应提供 song 参数让 AI 自己搜歌词')
+  assert.ok(speakDef.description.includes('song'))
   assert.equal(typeof speakDef.execute, 'function')
   assert.equal(typeof speakDef.output.render, 'function')
   assert.ok(speakDef.description.includes('OneBot'))
   assert.ok(speakDef.description.includes('唱歌'))
   dispose()
+})
+
+await test('clipLyrics 按整行裁到上限，不切半句', () => {
+  const lines = Array.from({ length: 20 }, (_, i) => `第${i + 1}句词`);
+  const text = lines.join('\n');
+  const clipped = clipLyrics(text, 40);
+  assert.equal(clipped.clipped, true);
+  assert.equal(clipped.totalLines, 20);
+  assert.equal(clipped.keptLines, 8);
+  assert.equal(clipped.text, lines.slice(0, 8).join('\n'));
+  const whole = clipLyrics(text, 999);
+  assert.equal(whole.clipped, false);
+  assert.equal(whole.text, text);
 })
 
 await test('tts_voices.execute 返回音色与通道状态（不联网）', async () => {
@@ -377,12 +435,12 @@ await test('tts_voices.execute 返回音色与通道状态（不联网）', asyn
   assert.ok(payload.onebot && typeof payload.onebot.httpUrl === 'string')
 })
 
-await test('tts_speak.execute 拒绝空文本（不产生网络请求）', async () => {
+await test('tts_speak.execute 拒绝既没有 text 也没有 song（不产生网络请求）', async () => {
   const defs = []
   registerTools({ tools: { register(d) { defs.push(d); return () => {} } } }, deps)
   const payload = JSON.parse(await defs.find((d) => d.name === 'tts_speak').execute({ text: '   ' }))
   assert.equal(payload.ok, false)
-  assert.match(payload.error, /text/)
+  assert.match(payload.error, /text 或 song/)
 })
 
 /* ----------------------------------------------------------------- onebot */
@@ -1275,6 +1333,28 @@ await test('ttsCfg 把默认配置解释成可用视图', () => {
   assert.equal(cfg.singStyle, '唱歌')
 })
 
+await test('格式只剩 wav / mp3：pcm16 与未知值都归一成 wav', () => {
+  assert.equal(ttsCfg({ format: 'wav' }, { rootDir: home }).format, 'wav')
+  assert.equal(ttsCfg({ format: 'mp3' }, { rootDir: home }).format, 'mp3')
+  assert.equal(ttsCfg({ format: 'pcm16' }, { rootDir: home }).format, 'wav')
+  assert.equal(ttsCfg({ format: 'pcm' }, { rootDir: home }).format, 'wav')
+  assert.equal(ttsCfg({ format: 'ogg' }, { rootDir: home }).format, 'wav')
+})
+
+await test('接口地址只填到 /v1 时自动补 /chat/completions，填全的不重复', () => {
+  assert.equal(openaiChatUrl('https://api.xiaomimimo.com/v1'), 'https://api.xiaomimimo.com/v1/chat/completions')
+  assert.equal(
+    openaiChatUrl('https://api.xiaomimimo.com/v1/chat/completions'),
+    'https://api.xiaomimimo.com/v1/chat/completions',
+  )
+  assert.equal(openaiChatUrl('https://api.xiaomimimo.com'), 'https://api.xiaomimimo.com/v1/chat/completions')
+  assert.equal(openaiChatUrl('https://api.xiaomimimo.com/v1/'), 'https://api.xiaomimimo.com/v1/chat/completions')
+  // 自定义路径保持原样：不认识的端点不要乱改
+  assert.equal(openaiChatUrl('https://proxy.example/tts'), 'https://proxy.example/tts')
+  assert.equal(openaiChatUrl('https://proxy.example/v1/tts'), 'https://proxy.example/v1/tts')
+  assert.throws(() => openaiChatUrl('not a url'), /不是合法 URL/)
+})
+
 await test('mimeFromFormat / guessModeForModel 与上游口径一致', () => {
   assert.equal(mimeFromFormat('wav'), 'audio/wav')
   assert.equal(mimeFromFormat('mp3'), 'audio/mpeg')
@@ -1489,6 +1569,413 @@ await test('POST /clone 上传短参考音频后，/config 立刻报 tooShort', 
   assert.ok(again.payload.clone.seconds > 2.5)
 })
 
+/* ------------------------------------------------- 参考音频窗口 & 唱歌标签 */
+
+await test('CLONE_MIN/MAX_REF_SECONDS 是 15~60 秒（克隆甜点区）', () => {
+  assert.equal(CLONE_MIN_REF_SECONDS, 15)
+  assert.equal(CLONE_MAX_REF_SECONDS, 60)
+})
+
+await test('describeTtsConfig 暴露 15~60 秒窗口，提示里也写着', () => {
+  const cfg = ttsCfg({}, { rootDir: home })
+  const view = describeTtsConfig(cfg)
+  assert.equal(view.cloneLimits.minSeconds, 15)
+  assert.equal(view.cloneLimits.maxSeconds, 60)
+  assert.match(view.cloneLimits.uploadHint, /15~60\s*秒/)
+  // 唱歌模板默认就填好了小米那套（用户不用手动配置），且与说话模板各自独立。
+  assert.match(view.singHeaderTemplate, /\{\{API_KEY\}\}/)
+  assert.match(view.singBodyTemplate, /\{\{SPEECH_JSON\}\}/)
+})
+
+await test('hasSingTag / stripSingTag 认得全角半角与 sing', () => {
+  for (const text of ['(唱歌)后来', '（唱歌）后来', '[唱歌]后来', '【唱歌】后来', '(sing)后来']) {
+    assert.equal(hasSingTag(text), true, `应认出 ${text}`)
+  }
+  assert.equal(hasSingTag('我们一起唱歌吧'), false)
+  assert.equal(stripSingTag('（唱歌）后来'), '后来')
+  assert.equal(stripSingTag('(唱歌) 后来'), '后来')
+})
+
+await test('唱歌时自动补 (唱歌)，用户自己写了就不重复加', () => {
+  const cfg = ttsCfg({ mode: 'preset', model: 'mimo-v2.5-tts', singStyle: '唱歌' }, { rootDir: home })
+  const auto = buildVars(cfg, { text: '后来', sing: true })
+  assert.equal(auto.SPEECH, '(唱歌)后来', '没写标签时应自动补在开头')
+  const manual = buildVars(cfg, { text: '（唱歌）后来', sing: true })
+  assert.equal(manual.SPEECH, '（唱歌）后来', '已经自带标签时不能再叠一层')
+  const plain = buildVars(cfg, { text: '后来', sing: false })
+  assert.equal(plain.SPEECH, '后来', '念白不该被加唱歌标签')
+})
+
+await test('唱歌模板与普通模板分开存，ttsCfg 原样透出', () => {
+  const cfg = ttsCfg(
+    {
+      headerTemplate: 'api-key: {{API_KEY}}',
+      bodyTemplate: '{"text":{{TEXT_JSON}}}',
+      singHeaderTemplate: 'api-key: {{API_KEY}}\r\nX-Sing: 1',
+      singBodyTemplate: '{"text":{{SPEECH_JSON}},"sing":true}',
+    },
+    { rootDir: home },
+  )
+  assert.match(cfg.singHeaderTemplate, /X-Sing: 1/)
+  assert.match(cfg.singBodyTemplate, /"sing":true/)
+  assert.match(cfg.headerTemplate, /api-key/)
+})
+
+await test('cleanLrc 去掉时间标签、制作人与标题行，保留歌词与副歌重复', () => {
+  const raw = [
+    '[00:00.000] 作词 : 某人',
+    '[00:00.000]晴天 - 周杰伦 (Jay Chou)',
+    '[00:02.250]词：周杰伦',
+    '[00:04.500]曲：周杰伦',
+    '[00:09.000]制作人：周杰伦',
+    '[00:11.250]合声：周杰伦',
+    '[00:20.000]故事的小黄花',
+    '[00:24.000]从出生那年就飘着',
+    '[00:30.000]故事的小黄花',
+  ].join('\n')
+  const out = cleanLrc(raw).split('\n')
+  assert.deepEqual(out, ['故事的小黄花', '从出生那年就飘着', '故事的小黄花'], `实际：${JSON.stringify(out)}`)
+})
+
+await test('cleanLrc 不误伤正常歌词（冒号 / 破折号出现在歌词里）', () => {
+  const raw = [
+    '[00:00.000]后来 我总算学会了如何去爱',
+    '[00:04.000]可惜你 早已远去 消失在人海',
+    '[00:08.000]他说：这就是爱情',
+  ].join('\n')
+  const out = cleanLrc(raw).split('\n')
+  assert.deepEqual(out, ['后来 我总算学会了如何去爱', '可惜你 早已远去 消失在人海', '他说：这就是爱情'])
+})
+
+/* ---------------------------------------- 唱歌独立模板真的发到了上游 */
+
+function silentWavBase64(seconds = 6.5, rate = 24000) {
+  const samples = Math.round(seconds * rate)
+  const buf = Buffer.alloc(44 + samples * 2)
+  buf.write('RIFF', 0)
+  buf.writeUInt32LE(36 + samples * 2, 4)
+  buf.write('WAVE', 8)
+  buf.write('fmt ', 12)
+  buf.writeUInt32LE(16, 16)
+  buf.writeUInt16LE(1, 20)
+  buf.writeUInt16LE(1, 22)
+  buf.writeUInt32LE(rate, 24)
+  buf.writeUInt32LE(rate * 2, 28)
+  buf.writeUInt16LE(2, 32)
+  buf.writeUInt16LE(16, 34)
+  buf.write('data', 36)
+  buf.writeUInt32LE(samples * 2, 40)
+  return buf.toString('base64')
+}
+
+const WAV_B64 = silentWavBase64()
+
+await test('唱歌用独立的请求头/请求体模板，念白仍用普通模板', async () => {
+  const seen = []
+  const srv = http.createServer((rq, rs) => {
+    let raw = ''
+    rq.on('data', (chunk) => { raw += chunk })
+    rq.on('end', () => {
+      seen.push({ headers: rq.headers, body: raw })
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: WAV_B64 } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${srv.address().port}`
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'mimo-v2.5-tts',
+      mode: 'preset',
+      headerTemplate: 'api-key: {{API_KEY}}',
+      bodyTemplate: '{"model":{{MODEL_JSON}},"messages":[{"role":"assistant","content":{{SPEECH_JSON}}}]}',
+      singHeaderTemplate: 'api-key: {{API_KEY}}\nX-Sing: 1',
+      singBodyTemplate: '{"model":{{MODEL_JSON}},"sing":true,"messages":[{"role":"assistant","content":{{SPEECH_JSON}}}]}',
+      singAttempts: 1,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+
+    const sung = await synthesize(cfg, { text: '后来', sing: true })
+    assert.equal(sung.sing, true)
+    assert.equal(sung.singTemplate, true, 'singTemplate 应标记用了独立模板')
+    assert.equal(sung.autoSingTag, true, '没写 (唱歌) 时应有自动补标签的标记')
+    assert.equal(seen[0].headers['x-sing'], '1', '唱歌请求该带唱歌请求头')
+    assert.match(seen[0].body, /"sing":true/, '唱歌请求该用唱歌请求体')
+    assert.match(seen[0].body, /（唱歌）|\(唱歌\)/, '文本开头应自动补唱歌标签')
+
+    const spoken = await synthesize(cfg, { text: '后来', sing: false })
+    assert.equal(spoken.sing, false)
+    assert.equal(spoken.singTemplate, false)
+    assert.equal(seen[1].headers['x-sing'], undefined, '念白不该带唱歌请求头')
+    assert.doesNotMatch(seen[1].body, /"sing":true/, '念白不该用唱歌请求体')
+  } finally {
+    srv.close()
+  }
+})
+
+await test('唱歌标签不会重复叠：用户写了 (唱歌) 就原样用', async () => {
+  const seen = []
+  const srv = http.createServer((rq, rs) => {
+    let raw = ''
+    rq.on('data', (chunk) => { raw += chunk })
+    rq.on('end', () => {
+      seen.push(raw)
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: WAV_B64 } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  try {
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      model: 'mimo-v2.5-tts',
+      mode: 'preset',
+      bodyTemplate: '{"messages":[{"role":"assistant","content":{{SPEECH_JSON}}}]}',
+      singAttempts: 1,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+    const result = await synthesize(cfg, { text: '（唱歌）后来', sing: true })
+    assert.equal(result.autoSingTag, false, '用户自己写了标签就不该再补')
+    const occurrences = (seen[0].match(/唱歌/g) || []).length
+    assert.equal(occurrences, 1, `(唱歌) 只能出现一次，实际：${seen[0]}`)
+  } finally {
+    srv.close()
+  }
+})
+
+/* ------------------------------------ 唱歌模板开箱即用、与说话模板互不影响 */
+
+await test('自定义说话模板不会污染唱歌：唱歌仍用自动配好的那份', async () => {
+  const seen = []
+  const srv = http.createServer((rq, rs) => {
+    let raw = ''
+    rq.on('data', (chunk) => { raw += chunk })
+    rq.on('end', () => {
+      seen.push({ headers: rq.headers, body: raw })
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: WAV_B64 } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  try {
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      model: 'mimo-v2.5-tts',
+      mode: 'preset',
+      // 用户把「说话」模板换成了自建接口的写法
+      headerTemplate: 'api-key: {{API_KEY}}\nX-Speak: 1',
+      bodyTemplate: '{"text":{{SPEECH_JSON}},"only":"speak"}',
+      singAttempts: 1,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+
+    // 唱歌：默认就该用自动配好的小米模板（不带 X-Speak，也不带 only:speak）
+    const sung = await synthesize(cfg, { text: '后来', sing: true })
+    assert.equal(sung.singTemplate, true, '唱歌应有自己的模板')
+    assert.equal(seen[0].headers['x-speak'], undefined, '唱歌不该带上说话模板的自定义头')
+    assert.doesNotMatch(seen[0].body, /only":"speak/, '唱歌不该用说话模板的请求体')
+    assert.match(seen[0].body, /"messages"/, '唱歌请求体应是小米 chat/completions 结构')
+
+    // 说话：仍用用户自己那份
+    await synthesize(cfg, { text: '后来', sing: false })
+    assert.equal(seen[1].headers['x-speak'], '1', '说话应保留用户自定义头')
+    assert.match(seen[1].body, /only":"speak/, '说话应保留用户自定义体')
+  } finally {
+    srv.close()
+  }
+})
+
+/* ------------------------ 唱歌判定按文本字数（不按请求体长度，克隆参考音频有 MB 级 DataURL） */
+
+function toneWavBase64(seconds = 8, rate = 24000, freq = 220, amplitude = 0.6) {
+  const samples = Math.round(seconds * rate)
+  const buf = Buffer.alloc(44 + samples * 2)
+  buf.write('RIFF', 0)
+  buf.writeUInt32LE(36 + samples * 2, 4)
+  buf.write('WAVE', 8)
+  buf.write('fmt ', 12)
+  buf.writeUInt32LE(16, 16)
+  buf.writeUInt16LE(1, 20)
+  buf.writeUInt16LE(1, 22)
+  buf.writeUInt32LE(rate, 24)
+  buf.writeUInt32LE(rate * 2, 28)
+  buf.writeUInt16LE(2, 32)
+  buf.writeUInt16LE(16, 34)
+  buf.write('data', 36)
+  buf.writeUInt32LE(samples * 2, 40)
+  for (let i = 0; i < samples; i += 1) {
+    buf.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * amplitude * 32767), 44 + i * 2)
+  }
+  return buf.toString('base64')
+}
+
+await test('唱歌判定按文本字数，不按请求体长度（克隆参考音频几 MB 时也要能判出真唱）', async () => {
+  const silent = silentWavBase64(6.5)
+  const sungWav = toneWavBase64(8)
+  let hits = 0
+  const srv = http.createServer((rq, rs) => {
+    rq.resume()
+    rq.on('end', () => {
+      hits += 1
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      // 第 1 次故意给念白（静音、没有有声段），第 2 次给「拖长音」的真唱。
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: hits === 1 ? silent : sungWav } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  const cloneDir = path.join(home, 'state', 'tts-clone')
+  fs.mkdirSync(cloneDir, { recursive: true })
+  fs.writeFileSync(path.join(cloneDir, 'ref.wav'), Buffer.from(silent, 'base64'))
+  try {
+    // 克隆模型的请求体会带上参考音频的 DataURL（几百 KB 起）——旧实现用 body.length 算阈值，
+    // 阈值会大到永远判「没唱」，于是每条念白都白重试满 5 次，最后把念白当结果返回。
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      model: 'mimo-v2.5-tts-voiceclone',
+      mode: 'clone',
+      clone: { fileName: 'ref.wav' },
+      singAttempts: 3,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+    const result = await synthesize(cfg, { text: '后来', sing: true })
+    assert.equal(result.attempts, 2, `第一次念白应被识别并重试一次，实际 ${result.attempts} 次`)
+    assert.equal(result.actuallySang, true, '第二次是有声的拖长音，应判为真唱')
+    assert.ok(result.voicedPerChar >= 0.33, `每字有声时长应达标，实际 ${result.voicedPerChar}`)
+    assert.equal(hits, 2, '判出真唱就该停下来，不应继续重试')
+  } finally {
+    srv.close()
+  }
+})
+
+/* ------------- 翻唱模型选择：只有 mimo-v2.5-tts 会唱，未指定时自动切过去 ------------- */
+
+await test('唱歌未指定模型时自动改用 mimo-v2.5-tts（克隆模型唱不出歌）', async () => {
+  const seen = []
+  const srv = http.createServer((rq, rs) => {
+    let raw = ''
+    rq.on('data', (chunk) => { raw += chunk })
+    rq.on('end', () => {
+      seen.push(raw)
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: WAV_B64 } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  const cloneDir = path.join(home, 'state', 'tts-clone')
+  fs.mkdirSync(cloneDir, { recursive: true })
+  fs.writeFileSync(path.join(cloneDir, 'ref.wav'), Buffer.from(WAV_B64, 'base64'))
+  try {
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      mode: 'clone',
+      clone: { fileName: 'ref.wav' },
+      singAttempts: 1,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+
+    // 没传 model：唱歌必须自动换成唯一会唱的预置音色模型。
+    const sung = await synthesize(cfg, { text: '后来', sing: true })
+    assert.equal(sung.sing, true)
+    assert.match(seen[0], /"model":\s*"mimo-v2\.5-tts"/, `唱歌应改用 mimo-v2.5-tts，实际：${seen[0].slice(0, 160)}`)
+    assert.ok(
+      (sung.warnings || []).some((w) => /临时改用 mimo-v2\.5-tts/.test(w)),
+      '应提示「已临时改用 mimo-v2.5-tts」',
+    )
+    assert.doesNotMatch(seen[0], /voiceclone/, '唱歌请求里不该再出现克隆模型')
+
+    // 显式指定模型则尊重选择（界面上选什么就发什么）。
+    const spoken = await synthesize(cfg, { text: '后来', sing: true, model: 'mimo-v2.5-tts-voicedesign' })
+    assert.equal(spoken.sing, true)
+    assert.match(seen[1], /"model":\s*"mimo-v2\.5-tts-voicedesign"/, '显式指定的模型不该被覆盖')
+  } finally {
+    srv.close()
+  }
+})
+
+await test('describeTtsConfig 暴露哪些模型支持唱歌', () => {
+  const cfg = ttsCfg({ apiKey: 'k', mode: 'preset' }, { rootDir: home })
+  const view = describeTtsConfig(cfg)
+  const models = view.singing.models
+  assert.ok(Array.isArray(models) && models.length >= 3, '应列出官方模型')
+  const singable = models.filter((m) => m.sing).map((m) => m.id)
+  assert.deepEqual(singable, ['mimo-v2.5-tts'], `只有预置音色模型支持唱歌，实际：${singable.join(',')}`)
+  assert.equal(view.singing.defaultModel, 'mimo-v2.5-tts', '默认唱歌模型应是 mimo-v2.5-tts')
+  assert.ok(Array.isArray(view.singing.voices) && view.singing.voices.length >= 5, '应带预置音色列表')
+  assert.match(view.singing.modelNote, /只有 mimo-v2\.5-tts/, '说明里要点明只有 mimo-v2.5-tts 会唱')
+})
+
+/* -------- 短句真唱：旧阈值按 3.5 秒起算，4 字唱 2.6 秒会被误判成念白 -------- */
+
+await test('短句真唱（约 2.6 秒）不再被判成念白', async () => {
+  let hits = 0
+  const srv = http.createServer((rq, rs) => {
+    rq.resume()
+    rq.on('end', () => {
+      hits += 1
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: toneWavBase64(2.6) } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  try {
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      model: 'mimo-v2.5-tts',
+      mode: 'preset',
+      singAttempts: 4,
+      timeoutMs: 15000,
+    }, { rootDir: home })
+    // 「后来」两个字：真唱约 0.6~1 秒/字，整体 2.6 秒。旧下限 3.5 秒会判 false，
+    // 于是白重试满 singAttempts 次、最后把念白当结果。
+    const result = await synthesize(cfg, { text: '后来', sing: true })
+    assert.equal(result.attempts, 1, `2.6 秒的有声拖长音应一次判定成功，实际重试 ${result.attempts} 次`)
+    assert.equal(result.actuallySang, true, '应判为真唱')
+    assert.ok(result.voicedPerChar >= 0.33, `每字有声时长应达标，实际 ${result.voicedPerChar}`)
+    assert.equal(hits, 1, '判出真唱就该停下来')
+  } finally {
+    srv.close()
+  }
+})
+
+/* ------------- 唱歌耗时不进路由延迟样本（否则会把 smart 路由拉向小米） ------------- */
+
+await test('唱歌不写进路由延迟样本', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tts-latency-'))
+  const srv = http.createServer((rq, rs) => {
+    rq.resume()
+    rq.on('end', () => {
+      rs.writeHead(200, { 'content-type': 'application/json' })
+      rs.end(JSON.stringify({ choices: [{ message: { audio: { data: toneWavBase64(8) } } }] }))
+    })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  try {
+    const cfg = ttsCfg({
+      apiKey: 'k',
+      baseUrl: `http://127.0.0.1:${srv.address().port}`,
+      model: 'mimo-v2.5-tts',
+      mode: 'preset',
+      singAttempts: 1,
+      timeoutMs: 15000,
+    }, { rootDir })
+    const before = readRouteLatency(rootDir)
+    await synthesize(cfg, { text: '后来', sing: true })
+    const after = readRouteLatency(rootDir)
+    assert.deepEqual(after.mimo, before.mimo, '唱歌不该写入 mimo 延迟样本')
+    assert.deepEqual(after.breeze, before.breeze, '唱歌不该写入 breeze 延迟样本')
+  } finally {
+    srv.close()
+    fs.rmSync(rootDir, { recursive: true, force: true })
+  }
+})
+
 /* ------------------------------------------------------------------- 收尾 */
 
 server.close()
@@ -1496,3 +1983,4 @@ fs.rmSync(home, { recursive: true, force: true })
 
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exitCode = 1
+
