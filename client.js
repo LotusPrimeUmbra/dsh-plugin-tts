@@ -170,59 +170,132 @@ window.__ModuleLoader__.load({
       return Math.sqrt(sum / (end - start));
     }
 
-    /** 找第一个「持续有声」的位置（跳过前奏/空白），找不到就 0。 */
-    function findSpeechStart(monoData, rate) {
-      const frame = Math.max(1, Math.round(rate * 0.05));
-      const minRun = Math.round(rate * 0.15);
-      let run = 0;
-      for (let i = 0; i + frame <= monoData.length; i += frame) {
-        if (rmsAt(monoData, i, frame) > 0.012) {
-          run += frame;
-          if (run >= minRun) return Math.max(0, i - (minRun - frame));
-        } else {
-          run = 0;
-        }
-      }
-      return 0;
-    }
-
-    /** 两端去静音（阈值 0.008，最多保留 60ms 余量）。 */
-    function trimSilence(monoData, rate) {
-      const frame = Math.max(1, Math.round(rate * 0.02));
-      let start = 0;
-      let end = monoData.length;
-      while (start + frame < end && rmsAt(monoData, start, frame) < 0.008) start += frame;
-      while (end - frame > start && rmsAt(monoData, end - frame, frame) < 0.008) end -= frame;
-      start = Math.max(0, start - Math.round(rate * 0.06));
-      end = Math.min(monoData.length, end + Math.round(rate * 0.06));
-      return monoData.subarray(start, end);
-    }
-
     function sliceMono(monoData, rate, { startSec, lengthSec }) {
       const from = Math.max(0, Math.round((Number(startSec) || 0) * rate));
       const length = Math.max(1, Math.round((Number(lengthSec) || 0) * rate));
       return monoData.subarray(from, Math.min(monoData.length, from + length));
     }
 
-    /** 参考音频的硬上限：上游对超长参考音频会直接拒（实测 30 秒以内都正常），超了自动截断。 */
-    const REF_MAX_SECONDS = 30;
+    /**
+     * 官方限制：参考音频 Base64 编码后的字符串长度 ≤ 10 MB（与小米 MiMo 官方一致）。
+     * 注意：官方**不限制时长**，所以这里也不做任何时长截断——长度完全由这个体积上限兜住。
+     */
+    const REF_MAX_BASE64_BYTES = 10 * 1024 * 1024;
+    /** 官方支持格式（与小米 MiMo 一致）：wav / wave / mp3。 */
+    const REF_ALLOWED_EXT = [".wav", ".wave", ".mp3"];
+    // decodeAudioData 会把整段解码成 float（24kHz 单声道约 96KB/秒），所以先卡文件体积：
+    // 200MB 的 wav 一解码就是几个 G，标签页会直接崩。
+    const REF_MAX_INPUT_BYTES = 64 * 1024 * 1024;
+    // 伴奏只做人声长度的循环播放，30MB 已经够长（mp3 约 20~30 分钟）。
+    const ACC_MAX_BYTES = 30 * 1024 * 1024;
     /** 有效语音低于这个秒数，克隆音色复现会明显不稳（实测 2.9 秒时长变异 40.8%，8 秒降到 12.9%）。 */
     const REF_MIN_SPEECH_SECONDS = 5;
+    /** 参考音频的目标时长：15~60 秒（长一点克隆更准）。超过 60 秒自动挑最佳窗口，不足 15 秒只提示。 */
+    const REF_MIN_SECONDS = 15;
+    const REF_MAX_SECONDS = 60;
+
+    /** 每 20ms 一帧的 RMS 序列。 */
+    function frameRms(monoData, rate, frameSec = 0.02) {
+      const size = Math.max(1, Math.round(rate * frameSec));
+      const out = [];
+      for (let i = 0; i + size <= monoData.length; i += size) out.push(rmsAt(monoData, i, size));
+      return out;
+    }
+
+    /**
+     * 估计环境噪声底：所有帧 RMS 的 10% 分位。
+     * 为什么不用固定阈值：手机录音的底噪、空调声、电流声经常就贴着 0.008，
+     * 固定阈值会把「开头那半秒杂音」当成语音留下，合成出来开头就有杂音。
+     */
+    function noiseFloorOf(frames) {
+      if (!frames.length) return 0;
+      const sorted = [...frames].sort((a, b) => a - b);
+      return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.1))] || 0;
+    }
+
+    /** 静音阈值 = 噪声底 × 3，并钳在 [0.006, 0.05]：太低会留杂音，太高会削掉气声起音。 */
+    function silenceThresholdOf(frames) {
+      return Math.max(0.006, Math.min(0.05, noiseFloorOf(frames) * 3));
+    }
+
+    /**
+     * 找「干净人声」的起止：连续 150ms 超过阈值才算真的开始（单个爆音 / 咳嗽不算），
+     * 两端各留 50ms 余量，避免把起音的辅音削掉。
+     */
+    function findVoiceBounds(monoData, rate, threshold, frameSec = 0.02) {
+      const size = Math.max(1, Math.round(rate * frameSec));
+      const flags = [];
+      for (let i = 0; i + size <= monoData.length; i += size) {
+        flags.push(rmsAt(monoData, i, size) >= threshold);
+      }
+      const run = Math.max(1, Math.round(0.15 / frameSec));
+      const runVoiced = (from) => {
+        for (let k = 0; k < run; k += 1) if (!flags[from + k]) return false;
+        return true;
+      };
+      let first = -1;
+      let last = -1;
+      for (let i = 0; i + run <= flags.length; i += 1) {
+        if (runVoiced(i)) { first = i; break; }
+      }
+      if (first < 0) return { start: 0, end: monoData.length };
+      for (let i = flags.length - run; i >= 0; i -= 1) {
+        if (runVoiced(i)) { last = i + run; break; }
+      }
+      const pad = Math.round(rate * 0.05);
+      return {
+        start: Math.max(0, first * size - pad),
+        end: Math.min(monoData.length, last * size + pad),
+      };
+    }
+
+    /**
+     * 在长音频里挑「有效语音最多」的一段（长度不超过 maxSec）。
+     *
+     * 为什么不用「从头截前 60 秒」：用户上传的常常是整首歌/整段会议录音，
+     * 开头 60 秒可能全是前奏或空白，截出来克隆效果很差。这里按 20ms 帧的
+     * 有声标记做前缀和，滑动 60 秒窗口取有声帧最多的一段（平局取更靠前的）。
+     */
+    function pickBestWindow(monoData, rate, maxSec, threshold) {
+      const frame = Math.max(1, Math.round(rate * 0.02));
+      const frames = Math.floor(monoData.length / frame);
+      const winFrames = Math.min(frames, Math.round(maxSec / 0.02));
+      if (frames <= winFrames) return { start: 0, end: monoData.length };
+      const prefix = new Int32Array(frames + 1);
+      for (let i = 0; i < frames; i += 1) {
+        prefix[i + 1] = prefix[i] + (rmsAt(monoData, i * frame, frame) >= threshold ? 1 : 0);
+      }
+      // 每 0.1 秒滑一次：1 秒的步长在「刚过 60 秒」的素材上等于只能取前 60 秒，
+  // 挑不到从 1 秒开始、语音更集中的那段。
+      const step = Math.max(1, Math.round(0.1 / 0.02));
+      let bestFrom = 0;
+      let bestScore = -1;
+      for (let from = 0; from + winFrames <= frames; from += step) {
+        const score = prefix[from + winFrames] - prefix[from];
+        if (score > bestScore) {
+          bestScore = score;
+          bestFrom = from;
+        }
+      }
+      const start = bestFrom * frame;
+      return { start, end: Math.min(monoData.length, start + winFrames * frame) };
+    }
 
     /**
      * 统计「有效语音」秒数：只算音量过阈值的帧，静音段不计。
      *
      * 为什么单独量这个：文件总时长会把首尾静音、停顿一起算进去。用户传一段 6 秒的录音，
      * 真正说话的可能只有 2 秒，克隆效果照样差 —— 判断「够不够长」必须看有效语音。
-     * 阈值与 trimSilence 对齐（0.008），避免两处口径不一致。
+     * 阈值由调用方传入：默认 0.008；上传参考音频时改用自适应噪声底（与 buildReferenceWav 同口径），
+     * 避免「安静录音被判成全程静音」或「噪声大的录音永远够长」两种误判。
      */
-    function measureSpeechSeconds(monoData, rate) {
+    function measureSpeechSeconds(monoData, rate, threshold = 0.008) {
       const frame = Math.max(1, Math.round(rate * 0.02));
       let voiced = 0;
       let total = 0;
       for (let i = 0; i + frame <= monoData.length; i += frame) {
         total += 1;
-        if (rmsAt(monoData, i, frame) >= 0.008) voiced += 1;
+        if (rmsAt(monoData, i, frame) >= threshold) voiced += 1;
       }
       if (!total) return 0;
       return (voiced / total) * (monoData.length / rate);
@@ -293,46 +366,247 @@ window.__ModuleLoader__.load({
       return `${fallback}.mp3`;
     }
 
-    /** 把用户选的若干音频文件剪成一段 24kHz 单声道 WAV（多段按顺序拼接）。 */
-    async function buildReferenceWav(files, options) {
+    /**
+     * 把用户选的若干音频文件剪成一段 24kHz 单声道 WAV（多段按顺序拼接）。
+     *
+     * 官方只限制「Base64 后 ≤ 10 MB」，不限时长，所以这里**不再截断 30 秒**。
+     * 默认会按自适应噪声底裁掉首尾静音、从干净人声开始（避免合成出来的开头带杂音）；
+     * 「截取」输入框仍然可用，是给用户手动微调的手段，不是强制上限。
+     */
+    async function buildReferenceWav(files, options = {}) {
+      for (const file of (Array.isArray(files) ? files : [])) {
+        if (file && file.size > REF_MAX_INPUT_BYTES) {
+          throw new Error(
+            `参考音频过大：${file.name || "这个文件"} ${(file.size / 1024 / 1024).toFixed(1)} MB，`
+            + `超过 ${REF_MAX_INPUT_BYTES / 1024 / 1024} MB 的本地处理上限（解码要占好几倍内存）：`
+            + "先剪到 15~60 秒，或勾选「原样上传」直接传 ≤ 10 MB 的 MP3",
+          );
+        }
+      }
       const parts = [];
       let counted = 0;
       for (const file of files) {
         const decoded = await decodeMono(file);
-        let data = decoded.mono;
-        if (options.trimSilence !== false) data = trimSilence(data, decoded.rate);
-        parts.push(data);
+        parts.push(decoded.mono);
         counted += 1;
       }
       let merged = parts.length === 1 ? parts[0] : concatMono(parts);
-      if (options.autoPick) {
-        const start = findSpeechStart(merged, TARGET_RATE);
-        merged = merged.subarray(start);
+      const originalSeconds = merged.length / TARGET_RATE;
+      let trimmed = false;
+      if (options.trimSilence !== false) {
+        const threshold = silenceThresholdOf(frameRms(merged, TARGET_RATE));
+        const bounds = findVoiceBounds(merged, TARGET_RATE, threshold);
+        if (bounds.start > 0 || bounds.end < merged.length) {
+          merged = merged.subarray(bounds.start, bounds.end);
+          trimmed = true;
+        }
       }
       const startSec = Number(options.startSec) || 0;
       const lengthSec = Number(options.lengthSec) || 0;
       if (startSec > 0 || lengthSec > 0) {
         merged = sliceMono(merged, TARGET_RATE, {
-          startSec: options.autoPick ? 0 : startSec,
+          startSec,
           lengthSec: lengthSec > 0 ? lengthSec : Math.max(1, merged.length / TARGET_RATE),
         });
       }
-      // 上游对超长参考音频会拒（HTTP 414 URI Too Long 一类），统一截到 30 秒以内。
-      // 先量再截：截断后有效语音可能变得更短，警告要按最终这段来算。
-      const beforeSec = merged.length / TARGET_RATE;
-      if (beforeSec > REF_MAX_SECONDS) {
-        merged = sliceMono(merged, TARGET_RATE, { startSec: 0, lengthSec: REF_MAX_SECONDS });
+      // 自动截取：超过 60 秒就挑「有效语音最多」的一段保留（15~60 秒是克隆更准的甜点区）。
+      // 手动了「截取」就不动它：用户显式给的范围优先级最高。
+      let clipped = false;
+      let clipFromSec = 0;
+      if (!(startSec > 0 || lengthSec > 0)) {
+        const maxFrames = Math.round(REF_MAX_SECONDS * TARGET_RATE);
+        if (merged.length > maxFrames) {
+          const clipThreshold = silenceThresholdOf(frameRms(merged, TARGET_RATE));
+          const win = pickBestWindow(merged, TARGET_RATE, REF_MAX_SECONDS, clipThreshold);
+          merged = merged.subarray(win.start, win.end);
+          clipped = true;
+          clipFromSec = win.start / TARGET_RATE;
+        }
       }
       const seconds = merged.length / TARGET_RATE;
-      const speechSeconds = measureSpeechSeconds(merged, TARGET_RATE);
+      const threshold = silenceThresholdOf(frameRms(merged, TARGET_RATE));
+      const speechSeconds = measureSpeechSeconds(merged, TARGET_RATE, threshold);
       const wav = encodeWav(merged, TARGET_RATE);
+      const b64Bytes = Math.ceil(wav.length / 3) * 4;
+      if (b64Bytes > REF_MAX_BASE64_BYTES) {
+        // 24kHz 16bit 单声道：10MB Base64 ≈ 163 秒。给用户一个可执行的上限。
+        const maxSeconds = Math.floor((REF_MAX_BASE64_BYTES * 3) / 4 / (TARGET_RATE * 2));
+        throw new Error(
+          `参考音频过大：Base64 后 ${(b64Bytes / 1024 / 1024).toFixed(2)} MB，官方上限 10 MB`
+          + `（当前 ${seconds.toFixed(1)} 秒；可剪到约 ${maxSeconds} 秒内，或勾选「原样上传」直接传 MP3）`,
+        );
+      }
       return {
         bytes: wav,
         seconds,
         speechSeconds,
-        trimmed: beforeSec > REF_MAX_SECONDS,
-        originalSeconds: beforeSec,
+        trimmed,
+        originalSeconds,
         files: counted,
+        b64Bytes,
+        clipped,
+        clipFromSec,
+        // 15 秒以下不拦，只提示：用户可能只有这一小段素材。
+        tooShort: seconds < REF_MIN_SECONDS,
+      };
+    }
+
+    /**
+     * 「原样上传」：不转码、不裁静音，保留 MP3 原文件（体积小，能放更长的参考音频）。
+     * 仍然只放行官方支持的 wav / wave / mp3，并按 Base64 10MB 卡体积。
+     */
+    async function buildRawReference(file) {
+      const ext = String(file.name || "").toLowerCase().match(/\.[^.]+$/)?.[0] || "";
+      if (!REF_ALLOWED_EXT.includes(ext)) {
+        throw new Error(`参考音频只支持 ${REF_ALLOWED_EXT.join(" / ")}（收到 ${ext || "无扩展名"}），与小米 MiMo 官方一致`);
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const b64Bytes = Math.ceil(bytes.length / 3) * 4;
+      if (b64Bytes > REF_MAX_BASE64_BYTES) {
+        throw new Error(
+          `参考音频过大：Base64 后 ${(b64Bytes / 1024 / 1024).toFixed(2)} MB，官方上限 10 MB（约原始 7.5 MB）`,
+        );
+      }
+      // 只为算出时长 / 有效语音，给面板显示用；上传的仍是原文件字节。
+      const decoded = await decodeMono(file);
+      const seconds = decoded.mono.length / decoded.rate;
+      const speechSeconds = measureSpeechSeconds(decoded.mono, decoded.rate);
+      return { bytes, seconds, speechSeconds, trimmed: false, originalSeconds: seconds, files: 1, b64Bytes, raw: true, ext };
+    }
+
+    /** Float32 立体声 → 16-bit PCM WAV。 */
+    function encodeWavStereo(left, right, rate) {
+      const frames = Math.min(left.length, right.length);
+      const dataSize = frames * 4;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+      const write = (offset, text) => {
+        for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+      };
+      write(0, "RIFF");
+      view.setUint32(4, 36 + dataSize, true);
+      write(8, "WAVE");
+      write(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 2, true);
+      view.setUint32(24, rate, true);
+      view.setUint32(28, rate * 4, true);
+      view.setUint16(32, 4, true);
+      view.setUint16(34, 16, true);
+      write(36, "data");
+      view.setUint32(40, dataSize, true);
+      let offset = 44;
+      for (let i = 0; i < frames; i += 1) {
+        const l = Math.max(-1, Math.min(1, left[i]));
+        const r = Math.max(-1, Math.min(1, right[i]));
+        view.setInt16(offset, l < 0 ? l * 0x8000 : l * 0x7fff, true);
+        offset += 2;
+        view.setInt16(offset, r < 0 ? r * 0x8000 : r * 0x7fff, true);
+        offset += 2;
+      }
+      return new Uint8Array(buffer);
+    }
+
+    /**
+     * 浏览器内混音（对应桌面 py 的 mix()）：人声 + 循环伴奏 → 48kHz 立体声 WAV。
+     *
+     * 为什么不在后端用 ffmpeg：很多机器（包括这台）并没有装 ffmpeg，插件也不打包二进制；
+     * 浏览器自带解码器（mp3/wav/m4a/ogg 都能读），OfflineAudioContext 渲染完再手写 WAV，
+     * 零依赖、跨平台。代价是 loudnorm 换成「峰值归一化 + 手动淡出」的近似。
+     */
+    async function mixCover({
+      vocalArray,
+      accompanimentFile = null,
+      vocalGainDb = 0,
+      accompanimentGainDb = -6,
+      fadeOutSec = 1.5,
+      sampleRate = 48000,
+    }) {
+      if (accompanimentFile && accompanimentFile.size > ACC_MAX_BYTES) {
+        throw new Error(
+          `伴奏文件 ${(accompanimentFile.size / 1024 / 1024).toFixed(1)} MB，超过 ${ACC_MAX_BYTES / 1024 / 1024} MB：`
+          + "本地混音要把整段解码进内存，请换小一点的伴奏（或先用播放器剪一段）",
+        );
+      }
+      const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      if (!OfflineCtx) throw new Error("当前浏览器不支持 OfflineAudioContext，无法在本地混音");
+      if (!vocalArray || !vocalArray.byteLength) throw new Error("没有可混音的唱歌人声");
+      // 先用 1 帧上下文解码，拿到真实时长后再按帧数渲染。
+      const probeCtx = new OfflineCtx(2, 1, sampleRate);
+      const vocalBuffer = await probeCtx.decodeAudioData(vocalArray.slice(0));
+      const duration = vocalBuffer.duration;
+      if (!(duration > 0)) throw new Error("唱歌人声解码后时长为 0");
+      // OfflineAudioContext 会把整段渲染进内存：48kHz 立体声 float 约 0.37 MB/秒，
+      // 5 分钟就接近 110 MB（人声 buffer + 渲染结果还要各一份），整首歌容易把标签页拖死。
+      // 与其崩掉，不如明确告诉用户分段唱。
+      const MAX_MIX_SECONDS = 300;
+      if (duration > MAX_MIX_SECONDS) {
+        throw new Error(
+          `人声 ${duration.toFixed(0)} 秒，超过本地混音上限 ${MAX_MIX_SECONDS} 秒（浏览器内存限制）：`
+          + "请把歌词分两段唱，或先不挂伴奏只取人声"
+        );
+      }
+      const ctx = new OfflineCtx(2, Math.max(1, Math.ceil(duration * sampleRate)), sampleRate);
+      const vocal = ctx.createBufferSource();
+      vocal.buffer = vocalBuffer;
+      const vocalGain = ctx.createGain();
+      vocalGain.gain.value = Math.pow(10, Number(vocalGainDb || 0) / 20);
+      vocal.connect(vocalGain).connect(ctx.destination);
+      vocal.start(0);
+      let withAccompaniment = false;
+      if (accompanimentFile) {
+        const bytes = await accompanimentFile.arrayBuffer();
+        const accBuffer = await ctx.decodeAudioData(bytes.slice(0));
+        const acc = ctx.createBufferSource();
+        acc.buffer = accBuffer;
+        acc.loop = true; // 对应 py 的 -stream_loop -1
+        const accGain = ctx.createGain();
+        accGain.gain.value = Math.pow(10, Number(accompanimentGainDb || 0) / 20);
+        acc.connect(accGain).connect(ctx.destination);
+        acc.start(0, 0, duration); // 只播到人声结束（amix duration=first）
+        withAccompaniment = true;
+      }
+      const rendered = await ctx.startRendering();
+      const left = rendered.getChannelData(0);
+      // 2 声道上下文正常都回 2 声道；万一渲染器只给单声道，就用副本，
+      // 否则 left/right 指向同一个数组，淡出和归一化会被应用两次（k² / scale²）。
+      const right = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : new Float32Array(left);
+      // 淡出（对应 py 的 afade=t=out）
+      const fade = Math.max(0, Number(fadeOutSec) || 0);
+      if (fade > 0 && left.length > 1) {
+        const fadeFrames = Math.min(left.length, Math.round(fade * sampleRate));
+        const from = left.length - fadeFrames;
+        for (let i = 0; i < fadeFrames; i += 1) {
+          const k = 1 - i / fadeFrames;
+          left[from + i] *= k;
+          right[from + i] *= k;
+        }
+      }
+      // 峰值归一化：只压不抬，-1.5 dBFS 留余量，避免削波。
+      let peak = 0;
+      for (let i = 0; i < left.length; i += 1) {
+        const a = Math.abs(left[i]);
+        const b = Math.abs(right[i]);
+        if (a > peak) peak = a;
+        if (b > peak) peak = b;
+      }
+      const target = Math.pow(10, -1.5 / 20);
+      const scale = peak > target ? target / peak : 1;
+      if (scale !== 1) {
+        for (let i = 0; i < left.length; i += 1) {
+          left[i] *= scale;
+          right[i] *= scale;
+        }
+      }
+      const bytes = encodeWavStereo(left, right, sampleRate);
+      return {
+        bytes,
+        durationSec: duration,
+        peak,
+        attenuated: scale !== 1,
+        withAccompaniment,
+        sampleRate,
       };
     }
 
@@ -605,26 +879,48 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------- template editor */
 
     function TemplateBlock({ kind, config, form, busy, onSave, onReset }) {
-      const [header, setHeader] = useState(form.headerTemplate);
-      const [body, setBody] = useState(form.bodyTemplate);
-      const [open, setOpen] = useState(false);
       const defaults = kind === "breeze"
         ? (config.styleDefaults && config.styleDefaults.breeze) || {}
         : (config.styleDefaults && config.styleDefaults.openai) || {};
+      const [header, setHeader] = useState(form.headerTemplate);
+      const [body, setBody] = useState(form.bodyTemplate);
+      // 唱歌专用模板：只有小米那套有唱歌，Breeze 协议没有「唱歌」这个概念。
+      // 与说话模板各自独立，这里直接显示已经填好的那份（默认 = 内置小米协议），用户不用手动改。
+      const [singHeader, setSingHeader] = useState(form.singHeaderTemplate || defaults.headerTemplate || "");
+      const [singBody, setSingBody] = useState(form.singBodyTemplate || defaults.bodyTemplate || "");
+      const [open, setOpen] = useState(false);
       const placeholders = Array.isArray(config.placeholders) ? config.placeholders : [];
 
       useEffect(() => {
         setHeader(form.headerTemplate);
         setBody(form.bodyTemplate);
-      }, [form.headerTemplate, form.bodyTemplate]);
+        setSingHeader(form.singHeaderTemplate || defaults.headerTemplate || "");
+        setSingBody(form.singBodyTemplate || defaults.bodyTemplate || "");
+      }, [form.headerTemplate, form.bodyTemplate, form.singHeaderTemplate, form.singBodyTemplate]);
 
-      const save = () => onSave({ headerTemplate: header, bodyTemplate: body });
+      // 唱歌模板跟着内置默认走时不写入配置（后端会兜底成默认那份），配置文件保持干净。
+      const singPatch = () => (kind === "breeze" ? {} : {
+        singHeaderTemplate: singHeader === (defaults.headerTemplate || "") ? "" : singHeader,
+        singBodyTemplate: singBody === (defaults.bodyTemplate || "") ? "" : singBody,
+      });
+
+      const save = () => onSave({
+        headerTemplate: header,
+        bodyTemplate: body,
+        ...singPatch(),
+      });
       const reset = () => {
         const nextHeader = defaults.headerTemplate || "";
         const nextBody = defaults.bodyTemplate || "";
         setHeader(nextHeader);
         setBody(nextBody);
-        onSave({ headerTemplate: nextHeader, bodyTemplate: nextBody });
+        setSingHeader(nextHeader);
+        setSingBody(nextBody);
+        onSave({
+          headerTemplate: nextHeader,
+          bodyTemplate: nextBody,
+          ...(kind === "breeze" ? {} : { singHeaderTemplate: "", singBodyTemplate: "" }),
+        });
       };
 
       return h(
@@ -668,7 +964,7 @@ window.__ModuleLoader__.load({
                 ),
                 h(
                   Field,
-                  { label: "请求体模板", hint: "必须能拼成合法 JSON；文本用 {{SPEECH}}（含风格标签）。" },
+                  { label: "请求体模板", hint: "必须能拼成合法 JSON；要念的内容用 {{SPEECH_JSON}}（带引号转义，含风格/唱歌标签）。" },
                   h("textarea", {
                     value: body,
                     rows: 8,
@@ -678,6 +974,42 @@ window.__ModuleLoader__.load({
                   }),
                 ),
               ),
+              kind === "breeze"
+                ? null
+                : h(
+                    "div",
+                    { style: { display: "flex", flexDirection: "column", gap: 6 } },
+                    h("div", { style: { fontSize: 11, color: tone.dim, lineHeight: 1.6 } },
+                      "唱歌和说话各用一套模板（已自动填好，一般不用改）：只有想给翻唱单独换模型 / 加 audio 参数时才动这里，不影响说话音色；歌词开头的 (唱歌) 由代码自动补。"),
+                    h(
+                      Row,
+                      { gap: 10 },
+                      h(
+                        Field,
+                        { label: "唱歌请求头", hint: "已按小米协议自动填好，一般不用改。" },
+                        h("textarea", {
+                          value: singHeader,
+                          rows: 3,
+                          spellCheck: false,
+                          placeholder: defaults.headerTemplate || "",
+                          onChange: (e) => setSingHeader(e.target.value),
+                          style: { ...inputStyle, fontFamily: mono, fontSize: 11, resize: "vertical" },
+                        }),
+                      ),
+                      h(
+                        Field,
+                        { label: "唱歌请求体", hint: "已按小米协议自动填好，一般不用改。" },
+                        h("textarea", {
+                          value: singBody,
+                          rows: 6,
+                          spellCheck: false,
+                          placeholder: defaults.bodyTemplate || "",
+                          onChange: (e) => setSingBody(e.target.value),
+                          style: { ...inputStyle, fontFamily: mono, fontSize: 11, resize: "vertical" },
+                        }),
+                      ),
+                    ),
+                  ),
               h(
                 Row,
                 { gap: 8, align: "center" },
@@ -697,9 +1029,9 @@ window.__ModuleLoader__.load({
       const info = kind === "sing" ? config.singRef : config.clone;
       const layout = (config.refLayout && config.refLayout[kind === "sing" ? "sing" : "clone"]) || {};
       const [files, setFiles] = useState([]);
-      // lengthSec 默认 0 = 整段（后端统一截到 30 秒以内）：克隆需要尽量多的有效语音，
-      // 默认截 6 秒会把一段 20 秒的录音白白砍掉三分之二，反而更容易出现音色不稳。
-      const [options, setOptions] = useState({ autoPick: true, lengthSec: "0", startSec: "0", trim: true });
+      // 默认「去静音 + 从干净人声开始」：官方不限时长，只限 Base64 ≤10MB，所以不再有 30 秒截断。
+      // 截取输入框保留，是给用户手动微调的手段，不是强制上限。
+      const [options, setOptions] = useState({ lengthSec: "0", startSec: "0", trim: true, raw: false });
       const [url, setUrl] = useState("");
       const fileRef = useRef(null);
       const audioRef = useRef(null);
@@ -711,13 +1043,14 @@ window.__ModuleLoader__.load({
         const picked = (fileRef.current && fileRef.current.files && Array.from(fileRef.current.files)) || files;
         if (!picked || !picked.length) return;
         const result = await onUpload(kind, picked, {
-          autoPick: options.autoPick,
-          lengthSec: Number(options.lengthSec) || 0,
           startSec: Number(options.startSec) || 0,
+          lengthSec: Number(options.lengthSec) || 0,
           trimSilence: options.trim,
+          raw: options.raw,
         });
-        // 上传成功后清空选择，避免再点一次重复上传同一份文件
-        if (result) {
+        // 上传成功后清空选择，避免再点一次重复上传同一份文件；失败时保留，
+// 用户改个选项（如去掉「原样上传」）就能直接重试，不用重新挑文件。
+        if (result && result.ok !== false) {
           setFiles([]);
           if (fileRef.current) fileRef.current.value = "";
         }
@@ -726,10 +1059,10 @@ window.__ModuleLoader__.load({
       const fromUrl = () => {
         if (!String(url).trim()) return;
         void onFetchUrl(kind, String(url).trim(), {
-          autoPick: options.autoPick,
-          lengthSec: Number(options.lengthSec) || 0,
           startSec: Number(options.startSec) || 0,
+          lengthSec: Number(options.lengthSec) || 0,
           trimSilence: options.trim,
+          raw: options.raw,
         });
       };
 
@@ -787,16 +1120,15 @@ window.__ModuleLoader__.load({
                 },
               },
               `参考音频过短：有效语音仅 ${info.speechSeconds.toFixed(1)} 秒，克隆效果会不稳定`
-                + `（同一句话每次合成的语速和音色都会有出入）。建议重新上传一段 10~30 秒连续说话的录音，`
-                + `超过 30 秒会自动截取前 30 秒。`,
+                + `（同一句话每次合成的语速和音色都会有出入）。建议重新上传一段 15~60 秒连续说话的录音。`,
             )
           : null,
         h(
           "div",
           { style: { fontSize: 10, color: tone.faint, lineHeight: 1.5 } },
           kind === "sing"
-            ? "唱歌参考只当歌词 / 音调 / 旋律的素材参考，不会被写进音色；唱歌时音色始终来自说话音色。"
-            : "只有参考音频里的音色被复刻。建议上传 10~30 秒连续说话的录音：太短（有效语音 < 5 秒）会让克隆出的音色和语速每次都不同，超过 30 秒会自动截取前 30 秒。",
+            ? "（旧版唱歌参考）只当歌词 / 音调 / 旋律的素材参考，不参与音色。"
+            : "只有参考音频里的音色被复刻。支持 WAV / WAVE / MP3（与小米 MiMo 官方一致），Base64 后上限 10 MB。默认自动裁掉首尾静音、从干净人声开始，并自动截取到 15~60 秒（长一点克隆更准；超过 60 秒挑有效语音最集中的一段，不足 15 秒只提示）。",
           layout.dir ? ` 目录：${layout.dir}` : "",
           info && info.backups && info.backups.count
             ? ` ｜ 备份 ${info.backups.count} 份 / ${fmtBytes(info.backups.bytes)}（最多保留 ${info.backups.keepLimit || 30} 份）`
@@ -825,7 +1157,7 @@ window.__ModuleLoader__.load({
             h("input", {
               ref: fileRef,
               type: "file",
-              accept: ".mp3,.wav,audio/mpeg,audio/wav",
+              accept: ".wav,.wave,.mp3,audio/wav,audio/mpeg",
               multiple: true,
               onChange: (e) => setFiles(Array.from(e.target.files || [])),
               style: { display: "none" },
@@ -859,13 +1191,16 @@ window.__ModuleLoader__.load({
           ),
           h(
             "label",
-            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 4, alignItems: "center" } },
+            {
+              style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 4, alignItems: "center" },
+              title: "不转码、不裁静音、也不做 15~60 秒自动截取，直接上传原文件（MP3 体积小，能放更长的参考音频）",
+            },
             h("input", {
               type: "checkbox",
-              checked: options.autoPick,
-              onChange: (e) => setOptions((prev) => ({ ...prev, autoPick: e.target.checked })),
+              checked: options.raw,
+              onChange: (e) => setOptions((prev) => ({ ...prev, raw: e.target.checked })),
             }),
-            "自动找起点",
+            "原样上传",
           ),
           h(
             "label",
@@ -878,7 +1213,7 @@ window.__ModuleLoader__.load({
               value: options.startSec,
               onChange: (e) => setOptions((prev) => ({ ...prev, startSec: e.target.value })),
               style: { ...inputStyle, width: 62, padding: "3px 6px" },
-              title: "起始秒数（自动找起点时忽略）",
+              title: "起始秒数（在自动去静音之后）",
             }),
             "秒起",
             h("input", {
@@ -888,7 +1223,7 @@ window.__ModuleLoader__.load({
               value: options.lengthSec,
               onChange: (e) => setOptions((prev) => ({ ...prev, lengthSec: e.target.value })),
               style: { ...inputStyle, width: 62, padding: "3px 6px" },
-              title: "截取时长（0 = 整段）",
+              title: "截取时长（0 = 整段；填了就跳过 15~60 秒自动截取）",
             }),
             "秒",
           ),
@@ -926,6 +1261,453 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /* ---------------------------------------------------------------- cover */
+
+    const coverNumberStyle = { ...inputStyle, width: 64, padding: "4px 7px" };
+
+    /**
+     * 「翻唱」卡片：歌词 + 可选伴奏 → 后端合成唱歌人声（复用 /preview sing:true）→
+     * 浏览器里把人声与伴奏混成一段 48kHz 立体声 WAV，可试听 / 下载。
+     * 对应桌面 py 的 mix()；插件不能假设本机装了 ffmpeg，所以混音放在前端做。
+     */
+    function CoverBlock({ config, form, busy, note, onCover, onLyrics }) {
+      const singInfo = config.singing || {};
+      const lyricInfo = config.lyrics || {};
+      const formStyle = form && form.mimo ? form.mimo.singStyle : "";
+      const cloneReady = Boolean(config.clone && config.clone.ready);
+      const [lyrics, setLyrics] = useState("");
+      // 初值优先取面板里刚编辑过（可能还没保存）的「唱歌风格词」，否则用服务端描述。
+      const [style, setStyle] = useState(String(formStyle || singInfo.singStyle || "唱歌"));
+      const [songQuery, setSongQuery] = useState("");
+      const [candidates, setCandidates] = useState([]);
+      const [lyricBusy, setLyricBusy] = useState(false);
+      const [lyricNote, setLyricNote] = useState("");
+      const [lyricSong, setLyricSong] = useState(null);
+      const [accFile, setAccFile] = useState(null);
+      const [voxGain, setVoxGain] = useState("0");
+      const [accGain, setAccGain] = useState("-6");
+      const [fadeOut, setFadeOut] = useState("1.5");
+      const [result, setResult] = useState(null);
+      const [mixUrl, setMixUrl] = useState("");
+      const [error, setError] = useState("");
+      // 模型 / 音色：小米 MiMo 只有预置音色模型（mimo-v2.5-tts）真的会唱，
+      // 克隆 / 音色设计模型唱出来基本是念白，所以默认选能唱的那个。
+      const singModels = Array.isArray(singInfo.models) && singInfo.models.length
+        ? singInfo.models
+        : (Array.isArray(config.officialModels) && config.officialModels.length
+            ? config.officialModels.map((m) => ({ ...m, sing: m.mode === "preset" }))
+            : [{ id: "mimo-v2.5-tts", label: "预置音色 TTS", mode: "preset", sing: true, note: "唯一支持唱歌的模型（预置音色）" }]);
+      const singVoices = Array.isArray(singInfo.voices) && singInfo.voices.length
+        ? singInfo.voices
+        : (Array.isArray(config.presetVoices) ? config.presetVoices : []).map((v) => (
+            typeof v === "string" ? { id: v, name: v } : { id: v.id, name: v.name || v.id }
+          ));
+      const [model, setModel] = useState(String(singInfo.defaultModel || "mimo-v2.5-tts"));
+      const [voice, setVoice] = useState(
+        String((form && form.mimo && form.mimo.voice) || config.voice || (singVoices[0] && singVoices[0].id) || "冰糖"),
+      );
+      const modelInfo = singModels.find((m) => m.id === model) || singModels[0] || {};
+      const modelCanSing = Boolean(modelInfo.sing);
+      const modelIsClone = /voiceclone|voice-clone|clone/i.test(String(model));
+      const accRef = useRef(null);
+
+      // 混音 Blob 的 URL 自己回收；否则每生成一次都在内存里留一份几十 MB 的 WAV。
+      useEffect(() => () => { if (mixUrl) URL.revokeObjectURL(mixUrl); }, [mixUrl]);
+
+      /**
+       * 搜歌词：点「搜歌词」先按歌名搜，取第一条的歌词；点候选则用 songId 精确取。
+       * 歌词正文由主进程从网易云公开接口拿回来（浏览器直连会被 CORS 挡）。
+       */
+      const searchLyrics = async (songId, songMeta = null) => {
+        if (typeof onLyrics !== "function") return;
+        const q = String(songQuery || "").trim();
+        if (!q && !songId) {
+          setLyricNote("先输入歌名（可以带歌手，例如「晴天 周杰伦」）");
+          return;
+        }
+        setLyricBusy(true);
+        setLyricNote("");
+        try {
+          const payload = await onLyrics({ query: q, songId: Number(songId) || 0 });
+          if (!payload) return;
+          if (payload.ok === false) {
+            setLyricNote(payload.error || "搜歌词失败");
+            return;
+          }
+          const list = Array.isArray(payload.candidates) ? payload.candidates : [];
+          // 点候选时服务端走 songId 分支，只回歌词、不回候选；这时保留已有列表，否则点一首就再也不能换歌。
+          if (list.length) setCandidates(list);
+          const song = payload.song || null;
+          if (song && song.lyrics) {
+            setLyrics(song.lyrics);
+            setLyricSong(song);
+            // songId 分支服务端只回歌词、不回歌名，用点的那条候选补上，提示才不至于只剩一个行数。
+            const songName = song.name || (songMeta && songMeta.name) || "";
+            const songArtist = song.artist || (songMeta && songMeta.artist) || "";
+            setLyricNote(`已填入：${songName || "这首歌"}${songArtist ? ` - ${songArtist}` : ""}（${song.lyrics.split("\n").length} 行）`);
+          } else {
+            setLyricNote(list.length ? `搜到 ${list.length} 首，点一首取歌词` : "没搜到，换个写法再试");
+          }
+        } catch (err) {
+          setLyricNote(err && err.message ? err.message : String(err));
+        } finally {
+          setLyricBusy(false);
+        }
+      };
+
+      const generate = async () => {
+        setError("");
+        const text = String(lyrics || "").trim();
+        if (!text) {
+          setError("先把要唱的歌词贴进来");
+          return;
+        }
+        try {
+          const payload = await onCover({
+            lyrics: text,
+            style: String(style || "").trim() || "唱歌",
+            model,
+            // 克隆模型没有「预置音色」可选：voice 留空，后端会用参考音频的 DataURL。
+            voice: modelIsClone ? "" : voice,
+            accFile,
+            vocalGainDb: Number(voxGain) || 0,
+            accompanimentGainDb: Number(accGain) || 0,
+            fadeOutSec: Number(fadeOut) || 0,
+          });
+          if (!payload) return;
+          // run() 把失败吞成 {ok:false,error} 返回（同时已经 flash 到本卡片的 note），这里就地再显示一次。
+          if (payload.ok === false) {
+            setResult(null);
+            // 清空旧混音 URL：effect 会顺手 revoke 它，避免一次失败后旧音频还占着内存。
+            setMixUrl("");
+            setError(payload.error || "生成失败");
+            return;
+          }
+          setResult(payload);
+          setMixUrl(payload.mixUrl || "");
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err));
+        }
+      };
+
+      return h(
+        Card,
+        {
+          title: "翻唱",
+          desc: "歌词 → 唱歌人声 → 浏览器内混伴奏",
+        },
+        h(
+          "div",
+          { style: { fontSize: 10, color: tone.faint, lineHeight: 1.6 } },
+          "贴歌词后生成唱歌人声，再在本地和伴奏混成一段 WAV（伴奏不会上传，也不需要本机装 ffmpeg）。",
+          " 也可以在对话里直接让 AI 唱（例如「唱一首晴天」）——AI 会自己搜歌词，不用你填。",
+          " 小米 MiMo 里只有 mimo-v2.5-tts（预置音色）真的会唱；选克隆 / 音色设计模型只会念白。",
+          singInfo.note ? ` ${singInfo.note}` : "",
+        ),
+        h(
+          Row,
+          { gap: 8, align: "center" },
+          h("input", {
+            value: songQuery,
+            placeholder: "歌名（可带歌手），回车直接搜歌词",
+            onChange: (e) => setSongQuery(e.target.value),
+            onKeyDown: (e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void searchLyrics(0);
+              }
+            },
+            style: { ...inputStyle, flex: "1 1 220px", padding: "5px 9px" },
+            title: "自动从网易云公开接口取歌词；搜不到就换成「歌名 + 歌手」再试",
+          }),
+          h(
+            Btn,
+            { kind: "primary", onClick: () => { void searchLyrics(0); }, disabled: busy || lyricBusy },
+            lyricBusy ? "搜歌词…" : "搜歌词",
+          ),
+        ),
+        candidates.length
+          ? h(
+              "div",
+              { style: { display: "flex", flexDirection: "column", gap: 3 } },
+              candidates.map((item) => h(
+                "button",
+                {
+                  type: "button",
+                  key: String(item.id),
+                  onClick: () => { void searchLyrics(item.id, item); },
+                  disabled: busy || lyricBusy,
+                  style: {
+                    textAlign: "left",
+                    border: `1px solid ${tone.line}`,
+                    background: "transparent",
+                    color: tone.text,
+                    fontSize: 11,
+                    padding: "4px 8px",
+                    borderRadius: 6,
+                    cursor: busy || lyricBusy ? "default" : "pointer",
+                    fontFamily: "inherit",
+                  },
+                },
+                `${item.name}${item.artist ? ` - ${item.artist}` : ""}${item.album ? `　${item.album}` : ""}`,
+              )),
+            )
+          : null,
+        lyricNote
+          ? h("div", { style: { fontSize: 10, color: tone.faint, lineHeight: 1.6 } }, lyricNote)
+          : null,
+        h("textarea", {
+          value: lyrics,
+          rows: 4,
+          placeholder: "歌词 / 要唱的词（支持换行，一次生成一段）",
+          onChange: (e) => setLyrics(e.target.value),
+          style: { ...inputStyle, resize: "vertical", minHeight: 78, fontFamily: "inherit" },
+        }),
+        h(
+          Row,
+          { gap: 8, align: "center" },
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 6, alignItems: "center" } },
+            "风格",
+            h("input", {
+              value: style,
+              onChange: (e) => setStyle(e.target.value),
+              style: { ...inputStyle, width: 148, padding: "4px 8px" },
+              title: "唱歌风格词（默认取「唱歌风格词」设置）；上游把它放在 user 位，并强制以 (唱歌) 开头",
+            }),
+          ),
+          h("span", { style: { flex: "1 1 auto" } }),
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 6, alignItems: "center" } },
+            h("input", {
+              ref: accRef,
+              type: "file",
+              accept: "audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac",
+              onChange: (e) => setAccFile((e.target.files && e.target.files[0]) || null),
+              style: { display: "none" },
+            }),
+            h(Btn, { onClick: () => { if (accRef.current) accRef.current.click(); }, disabled: busy }, accFile ? "换伴奏" : "选择伴奏"),
+            h(
+              "span",
+              {
+                style: {
+                  fontSize: 11,
+                  color: accFile ? tone.text : tone.faint,
+                  maxWidth: 170,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                },
+                title: accFile ? accFile.name : "不选伴奏 = 只出唱歌人声",
+              },
+              accFile ? accFile.name : "不用伴奏",
+            ),
+            accFile
+              ? h(Btn, {
+                  onClick: () => {
+                    setAccFile(null);
+                    if (accRef.current) accRef.current.value = "";
+                  },
+                  disabled: busy,
+                }, "去掉")
+              : null,
+          ),
+        ),
+        h(
+          Row,
+          { gap: 10, align: "center" },
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 5, alignItems: "center" } },
+            "人声",
+            h("input", {
+              type: "number",
+              step: 0.5,
+              min: -24,
+              max: 12,
+              value: voxGain,
+              onChange: (e) => setVoxGain(e.target.value),
+              style: coverNumberStyle,
+              title: "人声增益（dB），对应 py 的 --vox-gain",
+            }),
+            "dB",
+          ),
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 5, alignItems: "center" } },
+            "伴奏",
+            h("input", {
+              type: "number",
+              step: 0.5,
+              min: -40,
+              max: 12,
+              value: accGain,
+              onChange: (e) => setAccGain(e.target.value),
+              style: coverNumberStyle,
+              title: "伴奏增益（dB），对应 py 的 --acc-gain（默认 -6）",
+            }),
+            "dB",
+          ),
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 5, alignItems: "center" } },
+            "淡出",
+            h("input", {
+              type: "number",
+              step: 0.5,
+              min: 0,
+              max: 10,
+              value: fadeOut,
+              onChange: (e) => setFadeOut(e.target.value),
+              style: coverNumberStyle,
+              title: "结尾淡出秒数，对应 py 的 --fade",
+            }),
+            "秒",
+          ),
+        ),
+        h(
+          Row,
+          { gap: 8, align: "center" },
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 6, alignItems: "center" } },
+            "模型",
+            h(
+              "select",
+              {
+                value: model,
+                onChange: (e) => setModel(e.target.value),
+                style: { ...inputStyle, width: 236, padding: "4px 8px" },
+                title: singInfo.modelNote || "小米 MiMo 里只有 mimo-v2.5-tts 支持唱歌",
+              },
+              singModels.map((m) => h(
+                "option",
+                { key: m.id, value: m.id },
+                `${m.label}${m.sing ? "（支持唱歌）" : "（不支持唱歌）"}`,
+              )),
+            ),
+          ),
+          h(
+            "label",
+            { style: { fontSize: 11, color: tone.dim, display: "inline-flex", gap: 6, alignItems: "center" } },
+            "音色",
+            modelIsClone
+              ? h("span", { style: { fontSize: 11, color: tone.faint } }, cloneReady ? "克隆模型不会唱歌（会念白），音色取「说话音色」里的克隆参考" : "还没有克隆参考；且克隆模型不会唱歌，要唱请选 mimo-v2.5-tts")
+              : h(
+                  "select",
+                  {
+                    value: voice,
+                    onChange: (e) => setVoice(e.target.value),
+                    style: { ...inputStyle, width: 168, padding: "4px 8px" },
+                    title: "小米官方预置音色；只有 mimo-v2.5-tts 支持唱歌",
+                  },
+                  singVoices.map((v) => h("option", { key: v.id, value: v.id }, v.name || v.id)),
+                ),
+          ),
+        ),
+        modelCanSing
+          ? null
+          : h(
+              "div",
+              { style: { fontSize: 10, color: tone.warn, lineHeight: 1.6 } },
+              `⚠ ${modelInfo.note || "这个模型不支持唱歌"}：唱出来基本是念白，想真唱请把模型换成 mimo-v2.5-tts。`,
+            ),
+        h(
+          Row,
+          { gap: 8, align: "center" },
+          h(
+            Btn,
+            { kind: "primary", onClick: generate, disabled: busy || !String(lyrics || "").trim() },
+            busy === "cover" ? "合成 + 混音中…（短句几十秒，整首歌词要几分钟）" : "生成翻唱",
+          ),
+          h(
+            "span",
+            { style: { fontSize: 10, color: tone.faint } },
+            "唱歌是概率性的：上游有时只念白，会自动重试到像唱为止；混音结果峰值归一化到 -1.5 dBFS。",
+          ),
+        ),
+        error
+          ? h(
+              "div",
+              {
+                role: "alert",
+                style: {
+                  fontSize: 11,
+                  lineHeight: 1.55,
+                  color: tone.error,
+                  background: tone.surface2,
+                  border: `1px solid ${tone.error}`,
+                  borderRadius: 6,
+                  padding: "6px 9px",
+                  overflowWrap: "anywhere",
+                },
+              },
+              error,
+            )
+          : null,
+        result
+          ? h(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                  border: `1px solid ${tone.border}`,
+                  borderRadius: 8,
+                  padding: "9px 11px",
+                },
+              },
+              h(
+                "div",
+                { style: { fontSize: 11, color: tone.dim } },
+                `${result.route || "default"} · ${result.actuallySang === false ? "上游只念白（没真唱）" : "唱歌"}`
+                  + ` · 人声 ${Number(result.durationSec || 0).toFixed(1)} 秒`
+                  + ` · 重试 ${result.attempts || 1} 次`
+                  + ` · 混音 ${fmtBytes(result.mixBytes || 0)}`
+                  + (result.mixDurationSec ? ` / ${result.mixDurationSec.toFixed(1)} 秒` : ""),
+              ),
+              result.actuallySang === false
+                ? h(
+                    "div",
+                    { role: "alert", style: { fontSize: 11, lineHeight: 1.55, color: tone.warn } },
+                    "这次上游只念白没真唱：再生成一次，或把「唱歌风格词」换个说法（例如「女声清唱」）会更容易触发。",
+                  )
+                : null,
+              result.warnings && result.warnings.length
+                ? h(
+                    "ul",
+                    { style: { margin: 0, paddingLeft: 18, fontSize: 11, color: tone.warn, lineHeight: 1.6 } },
+                    result.warnings.map((w, i) => h("li", { key: i }, typeof w === "string" ? w : JSON.stringify(w))),
+                  )
+                : null,
+              h("div", { style: { fontSize: 11, color: tone.dim } }, "人声（服务端合成）"),
+              h("audio", { controls: true, src: result.vocalUrl, style: { width: "100%" } }),
+              mixUrl
+                ? h(
+                    "div",
+                    { style: { display: "flex", flexDirection: "column", gap: 6 } },
+                    h("div", { style: { fontSize: 11, color: tone.dim } }, "混音（浏览器内合成，48kHz 立体声 WAV）"),
+                    h("audio", { controls: true, src: mixUrl, style: { width: "100%" } }),
+                    h(
+                      "a",
+                      {
+                        href: mixUrl,
+                        download: `cover-${new Date().toISOString().replace(/[:.]/g, "-")}.wav`,
+                        style: { fontSize: 11, color: tone.text, textDecoration: "underline", width: "fit-content" },
+                      },
+                      "下载混音 WAV",
+                    ),
+                  )
+                : null,
+            )
+          : null,
+        h(CardNote, { note }),
+      );
+    }
+
     /* --------------------------------------------------------------- panels */
 
     function MimoPanel({ config, form, setForm, busy, actions, note, fetchNote, refNotes }) {
@@ -933,8 +1715,9 @@ window.__ModuleLoader__.load({
       const patch = (value) => setForm((prev) => ({ ...prev, mimo: { ...prev.mimo, ...value } }));
       const [msg, setMsg] = useState(null);
       const [pvText, setPvText] = useState("你好，我是 DeepSeek，这是「小米 MiMo」的试听。");
-      const [pvSing, setPvSing] = useState(false);
       const [pvResult, setPvResult] = useState(null);
+      // 翻唱是「合成模式」里的一页（不是 tts.mode 的取值）：打开它时只切 UI，不动配置里的 mode/model。
+      const [coverTab, setCoverTab] = useState(false);
       // Key 的保存结果就近显示在输入框下面：结果跑到页面别处时，用户会以为没反应。
       // 现在 Key 填完失焦即自动保存，不用再点按钮。
       const [keyMsg, setKeyMsg] = useState(null);
@@ -952,7 +1735,7 @@ window.__ModuleLoader__.load({
         setKeyMsg({ ok: true, text: `已自动保存并生效${payload.apiKeyHint ? `（当前 ${payload.apiKeyHint}）` : ""}` });
       };
       const runPreview = async (voice, extra = {}) => {
-        const payload = await actions.preview({ kind: "openai", text: pvText, sing: pvSing, voice, ...extra });
+        const payload = await actions.preview({ kind: "openai", text: pvText, voice, ...extra });
         if (!payload) return;
         setPvResult(payload.ok === false ? { ok: false, error: payload.error } : { ok: true, payload });
       };
@@ -1009,6 +1792,7 @@ window.__ModuleLoader__.load({
               spellCheck: false,
               onChange: (e) => patch({ baseUrl: e.target.value }),
               placeholder: "https://api.xiaomimimo.com/v1/chat/completions",
+              title: "也可以只填到 /v1（很多文档这么写），插件会自动补 /chat/completions",
               style: inputStyle,
             })),
           ),
@@ -1068,7 +1852,9 @@ window.__ModuleLoader__.load({
             h(Field, { label: "格式", width: 110 }, h(
               "select",
               { value: f.format, onChange: (e) => patch({ format: e.target.value }), style: inputStyle },
-              ["wav", "mp3", "pcm16", "pcm"].map((fmt) => h("option", { key: fmt, value: fmt }, fmt)),
+              // 只留能直接播放/发送的容器。pcm / pcm16 是裸流（没有 WAV/MP3 那种头），
+              // 浏览器 <audio> 和 QQ 语音都放不出来，留在下拉里只会让人误选。
+              ["wav", "mp3"].map((fmt) => h("option", { key: fmt, value: fmt }, fmt)),
             )),
             h(Field, { label: "单次上限（字符）", width: 130 }, h("input", {
               type: "number",
@@ -1133,12 +1919,15 @@ window.__ModuleLoader__.load({
 
         h(
           Card,
-          { title: "合成模式", desc: "预置音色 / 音色设计 / 克隆音色 / 自定义" },
+          { title: "合成模式", desc: "预置音色 / 音色设计 / 克隆音色 / 翻唱合成 / 自定义" },
           h(Tabs, {
-            value: f.mode,
+            value: coverTab ? "cover" : f.mode,
             // 切换模式必须连模型一起切，否则「克隆音色 + 预置模型」这种分叉会让参考音频
             // 被当成音色名发出去（上游 400），表现就是「选了克隆却念成预置语音」。
             onChange: (value) => {
+              // 翻唱页只是 UI 分页：翻唱自己选模型/音色，不能把 mode 改成它。
+              if (value === "cover") { setCoverTab(true); return; }
+              setCoverTab(false);
               const model = modelForMode(value, config.officialModels, f.model);
               patch(model ? { mode: value, model } : { mode: value });
             },
@@ -1146,10 +1935,11 @@ window.__ModuleLoader__.load({
               { value: "preset", label: "预置音色" },
               { value: "voicedesign", label: "音色设计" },
               { value: "clone", label: "克隆音色" },
+              { value: "cover", label: "翻唱合成" },
               { value: "custom", label: "自定义" },
             ],
           }),
-          f.mode === "preset"
+          !coverTab && f.mode === "preset"
             ? h(
                 "div",
                 { style: { display: "flex", flexDirection: "column", gap: 8 } },
@@ -1170,7 +1960,7 @@ window.__ModuleLoader__.load({
                 f.voice ? h(Note, null, `当前音色：${f.voice}`) : h(Note, { kind: "warn" }, "还没有选音色。"),
               )
             : null,
-          f.mode === "voicedesign"
+          !coverTab && f.mode === "voicedesign"
             ? h(
                 "div",
                 { style: { display: "flex", flexDirection: "column", gap: 8 } },
@@ -1184,7 +1974,7 @@ window.__ModuleLoader__.load({
                 h(Btn, { onClick: () => { void runPreview(undefined, { design: f.design }); }, disabled: busy }, "用这段描述试听"),
               )
             : null,
-          f.mode === "clone"
+          !coverTab && f.mode === "clone"
             ? h(
                 "div",
                 { style: { display: "flex", flexDirection: "column", gap: 8 } },
@@ -1198,24 +1988,25 @@ window.__ModuleLoader__.load({
                   onBackup: actions.refBackup,
                   onFetchUrl: actions.fetchRefUrl,
                 }),
-                h(RefBlock, {
-                  kind: "sing",
-                  config,
-                  busy,
-                  note: refNotes ? refNotes["ref-sing"] : null,
-                  onUpload: actions.uploadRef,
-                  onClear: actions.clearRef,
-                  onBackup: actions.refBackup,
-                  onFetchUrl: actions.fetchRefUrl,
-                }),
               )
             : null,
-          f.mode === "custom"
+          !coverTab && f.mode === "custom"
             ? h(Note, null, "自定义模式：用你在「请求头 / 请求体模板」里写的模板直接请求上游，适用于自建或第三方兼容接口。"
               + " 模型 id 手填、音色用 {{VOICE}} 自行拼接，代码不会替你猜参数。")
             : null,
+          coverTab
+            ? h(CoverBlock, {
+                config,
+                form,
+                busy,
+                note: refNotes ? refNotes["cover"] : null,
+                onCover: actions.cover,
+                onLyrics: actions.lyrics,
+              })
+            : null,
         ),
 
+        // 翻唱已经挪到「合成模式 → 翻唱合成」这一页，不再单独占一张卡片。
         h(
           Card,
           { title: "请求模板", desc: "改模板前先试听一次，确认能通" },
@@ -1236,8 +2027,6 @@ window.__ModuleLoader__.load({
           busy,
           text: pvText,
           onText: setPvText,
-          sing: pvSing,
-          onSing: setPvSing,
           result: pvResult,
           onRun: () => runPreview(),
         }),
@@ -1267,7 +2056,6 @@ window.__ModuleLoader__.load({
       }));
       const [msg, setMsg] = useState(null);
       const [pvText, setPvText] = useState("你好，我是 DeepSeek，这是「Breeze」的试听。");
-      const [pvSing, setPvSing] = useState(false);
       const [pvResult, setPvResult] = useState(null);
       const [keyMsg, setKeyMsg] = useState(null);
       const autoSaveKeyNow = async () => {
@@ -1282,7 +2070,7 @@ window.__ModuleLoader__.load({
         setKeyMsg({ ok: true, text: `已自动保存并生效${payload.breeze && payload.breeze.apiKeyHint ? `（当前 ${payload.breeze.apiKeyHint}）` : ""}` });
       };
       const runPreview = async (voice, extra = {}) => {
-        const payload = await actions.preview({ kind: "breeze", text: pvText, sing: pvSing, voice, ...extra });
+        const payload = await actions.preview({ kind: "breeze", text: pvText, voice, ...extra });
         if (!payload) return;
         setPvResult(payload.ok === false ? { ok: false, error: payload.error } : { ok: true, payload });
       };
@@ -1464,8 +2252,6 @@ window.__ModuleLoader__.load({
           busy,
           text: pvText,
           onText: setPvText,
-          sing: pvSing,
-          onSing: setPvSing,
           result: pvResult,
           onRun: () => runPreview(),
         }),
@@ -1486,7 +2272,7 @@ window.__ModuleLoader__.load({
     }
 
     /* 每个协议面板各自的试听区（受控展示，状态放在面板内部，互不串用） */
-    function PreviewBlock({ label, busy, text, onText, sing, onSing, result, onRun }) {
+    function PreviewBlock({ label, busy, text, onText, result, onRun }) {
       return h(
         Card,
         { title: `试听（${label}）`, desc: "只用这块面板的接口与音色合成，不发送到 QQ" },
@@ -1500,7 +2286,6 @@ window.__ModuleLoader__.load({
           Row,
           { gap: 8, align: "center" },
           h(Btn, { kind: "primary", onClick: () => { void onRun(); }, disabled: busy }, busy === "preview" ? "合成中…" : "试听"),
-          h(Switch, { checked: sing, label: "唱歌", onChange: onSing }),
           result && result.ok
             ? h("span", { style: { fontSize: 11, color: tone.ok } },
                 `${result.payload.route} · ${result.payload.actuallySang ? "唱歌" : "念白"} · ${result.payload.durationSec ?? "?"} 秒 · ${fmtBytes(result.payload.bytes)} · ${result.payload.elapsedMs ?? "?"}ms`)
@@ -1570,6 +2355,9 @@ window.__ModuleLoader__.load({
           maxChars: String(config.maxChars ?? 2000),
           headerTemplate: config.headerTemplate || "",
           bodyTemplate: config.bodyTemplate || "",
+          // 唱歌专用模板（与上面两份分开存）；空串 = 跟随普通模板。
+          singHeaderTemplate: config.singHeaderTemplate || "",
+          singBodyTemplate: config.singBodyTemplate || "",
         },
         breeze: {
           baseUrl: (config.breeze && config.breeze.baseUrl) || "",
@@ -1678,7 +2466,9 @@ window.__ModuleLoader__.load({
           flash(text, "error", scope);
           return { ok: false, error: text };
         } finally {
-          if (mounted.current) setBusy("");
+          // 只清自己那次：两个 action 并发时（比如翻唱合成中又点了保存），
+          // 先结束的那个不该把还在跑的按钮恢复成可点，否则用户会重复触发、白花额度。
+          if (mounted.current) setBusy((current) => (current === name ? "" : current));
         }
       };
 
@@ -1727,6 +2517,8 @@ window.__ModuleLoader__.load({
           maxChars: Number(f.maxChars) || 2000,
           headerTemplate: f.headerTemplate,
           bodyTemplate: f.bodyTemplate,
+          singHeaderTemplate: f.singHeaderTemplate || "",
+          singBodyTemplate: f.singBodyTemplate || "",
           ...(options.patch || {}),
         };
         if (f.mode !== "clone" && f.mode !== "voicedesign" && f.voice) tts.voice = f.voice;
@@ -1941,27 +2733,36 @@ window.__ModuleLoader__.load({
       // 用户感知就是「每次音色/语速都不一样」。与其让他自己猜，不如上传当场说清楚。
       const refMessage = (kind, built) => {
         const label = kind === "sing" ? "唱歌参考" : "说话音色";
-        const head = `${label}已上传：${built.seconds.toFixed(1)} 秒 / ${fmtBytes(built.bytes.length)}`;
+        const head = `${label}已上传：${built.seconds.toFixed(1)} 秒 / ${fmtBytes(built.bytes.length)}`
+          + (built.raw ? "（原样上传）" : "（24kHz 单声道 wav）");
         const parts = [head];
         if (built.trimmed) {
-          parts.push(`已自动截取前 ${REF_MAX_SECONDS} 秒（原长 ${built.originalSeconds.toFixed(1)} 秒）`);
+          parts.push(`已自动裁掉首尾静音、从干净人声开始（原长 ${built.originalSeconds.toFixed(1)} 秒）`);
+        }
+        if (built.clipped) {
+          // 远长于 60 秒时不是从 0 秒硬截，而是挑「有效语音最多」的一段，这里把起点说清楚。
+          parts.push(
+            `已自动截取有效语音最集中的一段：从 ${built.clipFromSec.toFixed(1)} 秒起，`
+            + `共 ${built.seconds.toFixed(1)} 秒（15~60 秒克隆更准，原长 ${built.originalSeconds.toFixed(1)} 秒）`,
+          );
+        }
+        if (kind !== "sing" && built.tooShort) {
+          parts.push(`⚠ 参考音频偏短（${built.seconds.toFixed(1)} 秒）：建议 15~60 秒，太短克隆出来的音色和语速会飘。`);
         }
         if (kind !== "sing" && built.speechSeconds < REF_MIN_SPEECH_SECONDS) {
           parts.push(
-            `⚠ 参考音频过短：有效语音仅 ${built.speechSeconds.toFixed(1)} 秒，克隆效果会不稳定`
-            + `（同一句话每次的语速和音色都会有出入）。建议上传 10~30 秒连续说话的录音，`
-            + `超过 30 秒会自动截取前 30 秒。`
+            `⚠ 有效语音仅 ${built.speechSeconds.toFixed(1)} 秒，克隆效果会不稳定`
+            + `（同一句话每次的语速和音色都会有出入）。建议上传 15~60 秒连续说话的录音。`,
           );
         }
-        return {
-          text: parts.join(" ｜ "),
-          kind: kind !== "sing" && built.speechSeconds < REF_MIN_SPEECH_SECONDS ? "warn" : "ok",
-        };
+        const warn = kind !== "sing" && (built.tooShort || built.speechSeconds < REF_MIN_SPEECH_SECONDS);
+        return { text: parts.join(" ｜ "), kind: warn ? "warn" : "ok" };
       };
 
-      const uploadRef = (kind, files, options) => run(`upload-${kind}`, async () => {
-        const built = await buildReferenceWav(files, options);
-        const name = `${files[0].name.replace(/\.[^.]+$/, "") || "reference"}.wav`;
+      const uploadRef = (kind, files, options = {}) => run(`upload-${kind}`, async () => {
+        const built = options.raw ? await buildRawReference(files[0]) : await buildReferenceWav(files, options);
+        const ext = built.raw ? built.ext : ".wav";
+        const name = `${(files[0].name || "reference").replace(/\.[^.]+$/, "") || "reference"}${ext}`;
         const payload = await post("/clone", {
           fileName: name,
           kind,
@@ -1971,7 +2772,8 @@ window.__ModuleLoader__.load({
           // 存进配置后，面板就能一直显示「这段到底多长、有效语音够不够」。
           seconds: built.seconds,
           speechSeconds: built.speechSeconds,
-        });        if (mounted.current) {
+        });
+        if (mounted.current) {
           // 用 applyPanel 而不是 setConfig：上传说话音色后后端会把 mode 切成 clone，
           // 只有重建 form 才能让「合成模式」tab 跟着跳过去。
           applyPanel(payload);
@@ -2004,9 +2806,10 @@ window.__ModuleLoader__.load({
         const blob = base64ToBlob(fetched.dataBase64, fetched.mimeType);
         const name = blobName(blob, "imported");
         const file = new File([blob], name, { type: fetched.mimeType || "audio/mpeg" });
-        const built = await buildReferenceWav([file], options);
+        const built = options && options.raw ? await buildRawReference(file) : await buildReferenceWav([file], options);
+        const ext = built.raw ? built.ext : ".wav";
         const payload = await post("/clone", {
-          fileName: `${name.replace(/\.[^.]+$/, "")}.wav`,
+          fileName: `${name.replace(/\.[^.]+$/, "")}${ext}`,
           kind,
           dataBase64: bytesToBase64(built.bytes),
           overwrite: true,
@@ -2018,6 +2821,100 @@ window.__ModuleLoader__.load({
         flash(msg.text.replace(/^(说话音色|唱歌参考)已上传/, "已从链接导入参考音频"), msg.kind, kind === "sing" ? "ref-sing" : "ref-clone");
         return payload;
       }, null, kind === "sing" ? "ref-sing" : "ref-clone");
+
+      /**
+       * 翻唱：复用 /preview 合成唱歌人声（sing:true），取回音频后在浏览器里与伴奏混音。
+       * 后端不碰伴奏——插件不能假设本机装了 ffmpeg，混音放前端做（见 mixCover）。
+       */
+      const cover = (options = {}) => run("cover", async () => {
+        const scope = options.scope || "cover";
+        const lyrics = String(options.lyrics || "").trim();
+        if (!lyrics) throw new Error("翻唱歌词不能为空");
+        const payload = await post("/preview", {
+          text: lyrics,
+          apiStyle: "openai",
+          // 混音要用 decodeAudioData 解码人声，裸 PCM（pcm/pcm16）浏览器读不了：
+          // 翻唱固定要 wav，不受面板里「格式」设置影响。
+          format: "wav",
+          baseUrl: form.mimo.baseUrl,
+          apiKey: form.mimo.apiKey,
+          headerTemplate: form.mimo.headerTemplate,
+          bodyTemplate: form.mimo.bodyTemplate,
+          // 唱歌有独立的请求头/请求体模板就带上（与说话音色分开）；留空时后端沿用普通模板。
+          singHeaderTemplate: form.mimo.singHeaderTemplate,
+          singBodyTemplate: form.mimo.singBodyTemplate,
+          // 唱歌只有预置音色模型（mimo-v2.5-tts）真的会唱：卡片没指定模型时默认用它，
+          // 否则会拿克隆 / 音色设计模型去唱，结果就是念白。
+          model: String(options.model || "mimo-v2.5-tts").trim() || "mimo-v2.5-tts",
+          ...(String(options.voice ?? "").trim() ? { voice: String(options.voice).trim() } : {}),
+          // 唱歌风格词默认取设置里的 singStyle；上游会把它放 user 位并强制正文以 (唱歌) 开头。
+          style: String(options.style || form.mimo.singStyle || "唱歌").trim() || "唱歌",
+          sing: true,
+        });
+        const res = await fetch(`${API}/audio?id=${encodeURIComponent(payload.audioId)}`);
+        if (!res.ok) throw new Error(`取回合成音频失败：HTTP ${res.status}`);
+        const vocalArray = await res.arrayBuffer();
+        const mixed = await mixCover({
+          vocalArray,
+          accompanimentFile: options.accFile || null,
+          vocalGainDb: options.vocalGainDb,
+          accompanimentGainDb: options.accompanimentGainDb,
+          fadeOutSec: options.fadeOutSec,
+        });
+        // Blob URL 由 CoverBlock 负责回收（它持有 mixUrl 的生命周期）。
+        const mixUrl = URL.createObjectURL(new Blob([mixed.bytes], { type: "audio/wav" }));
+        const out = {
+          ...payload,
+          vocalUrl: `${API}/audio?id=${encodeURIComponent(payload.audioId)}`,
+          mixUrl,
+          mixBytes: mixed.bytes.length,
+          mixDurationSec: mixed.durationSec,
+          withAccompaniment: mixed.withAccompaniment,
+        };
+        if (mounted.current) {
+          flash(
+            `已生成：人声 ${Number(payload.durationSec || 0).toFixed(1)} 秒`
+              + `${mixed.withAccompaniment ? "，已混入伴奏" : "（未加伴奏）"}`
+              + ` · ${payload.attempts || 1} 次尝试`
+              + (payload.actuallySang === false ? " · ⚠ 上游这次只念白" : ""),
+            payload.actuallySang === false ? "warn" : "ok",
+            scope,
+          );
+        }
+        return out;
+      }, null, options.scope || "cover");
+
+      /**
+       * 搜歌词：由主进程调网易云公开接口（浏览器直连会被 CORS 挡）。
+       * 返回候选列表 + 第一条候选的歌词正文；点候选时用 songId 再取一次。
+       */
+      const lyrics = (options = {}) => run("lyrics", async () => {
+        const query = String(options.query || "").trim();
+        const songId = Number(options.songId) || 0;
+        if (!query && !songId) throw new Error("先输入歌名再搜歌词");
+        const payload = await post("/lyrics", { query, songId });
+        if (mounted.current) {
+          const song = payload.song || {};
+          if (song.lyrics) {
+            flash(
+              `已填入歌词：${song.name || query}${song.artist ? ` - ${song.artist}` : ""}`
+                + `（${song.lyrics.split("\n").length} 行，开头 (唱歌) 会自动补）`,
+              "ok",
+              "cover",
+            );
+          } else {
+            const count = Array.isArray(payload.candidates) ? payload.candidates.length : 0;
+            flash(
+              count
+                ? `搜到 ${count} 首，但没取到歌词正文：点下面的候选再试`
+                : "没取到歌词正文（可能是纯音乐或没版权），换个歌名再试",
+              "warn",
+              "cover",
+            );
+          }
+        }
+        return payload;
+      }, null, "cover");
 
       const ping = () => run("ping", async () => {
         const payload = await post("/ping");
@@ -2036,7 +2933,7 @@ window.__ModuleLoader__.load({
         return payload;
       }, null, "onebot");
 
-      const actions = { load, saveMimo, saveBreeze, autoSaveKey, saveOnebot, fetchModels, fetchVoices, preview, speakNow, uploadRef, clearRef, refBackup, fetchRefUrl, ping, importConfig };
+      const actions = { load, saveMimo, saveBreeze, autoSaveKey, saveOnebot, fetchModels, fetchVoices, preview, speakNow, uploadRef, clearRef, refBackup, fetchRefUrl, cover, lyrics, ping, importConfig };
       // 每张卡片的通知：面板组件按 scope 取自己的那条。
       const noteOf = (scope) => notes[scope] || null;
       // 「拉取模型」这类按钮的结果要**紧跟按钮**显示，不能落到卡片最底部（离得太远看不见）。
@@ -2247,7 +3144,7 @@ window.__ModuleLoader__.load({
             h("div", null, `配置：${state.configPath}`),
             h("div", null, `数据：${config.storage.dataDir}`),
             h("div", null, `缓存：${config.storage.cacheDir}`),
-            h("div", null, `克隆参考：${config.clone.ready ? "已有" : "无"} ｜ 唱歌参考：${config.singRef.ready ? "已有" : "无"}`),
+            h("div", null, `克隆参考：${config.clone.ready ? "已有" : "无"} ｜ 唱歌：mimo-v2.5-tts（预置音色，只有它会唱）`),
             h("div", null, `小米 Key：${config.mimo.apiKeySet ? config.mimo.apiKeyHint : "未设置"} ｜ Breeze Key：${config.breeze.apiKeySet ? config.breeze.apiKeyHint : "未设置"}`),
             h("div", null, `调用上限：${config.maxChars} 字符 ｜ 超时：${Math.round((config.timeoutMs || 180000) / 1000)}s`),
           ),

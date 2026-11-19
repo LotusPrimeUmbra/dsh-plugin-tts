@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-tts",
-  "version": "0.4.2",
+  "version": "0.4.4",
   "description": "DeepSeek Harness 的 TTS 语音合成插件：小米 MiMo / Breeze 双协议合成、试听、克隆音色、唱歌，并可直接通过 OneBot 发 QQ 语音。",
   "type": "module",
   "main": "index.js",
