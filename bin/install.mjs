@@ -28,6 +28,7 @@ const REQUIRED = [
   'lib/speak.js',
   'lib/routes.js',
   'lib/tools.js',
+  'lib/lyrics.js',
   'lib/logger.js',
   'locale/zh.json',
   'locale/en.json',
@@ -41,6 +42,14 @@ function home() {
 
 function line(text = '') {
   console.log(text)
+}
+
+function countFiles(dir) {
+  let total = 0
+  for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+    total += item.isDirectory() ? countFiles(path.join(dir, item.name)) : 1
+  }
+  return total
 }
 
 function check() {
@@ -114,8 +123,33 @@ function check() {
     if (result.status !== 0) problems.push(`语法错误：${rel}\n${String(result.stderr || '').trim()}`)
   }
 
+  // 反向检查：files 白名单之外的条目不会被打进包（--pack 已按白名单拷贝），
+  // 但它们说明工作区里有不该发布的东西。只提示、不判失败 —— 开发中间态本来就会有。
+  // 没有这一层时，「该有的在不在」永远是绿的，多出来的日志/备份/临时文件没人说话。
+  const listed = Array.isArray(meta?.files) ? meta.files.map((rel) => String(rel).replace(/\\/g, '/').replace(/\/+$/, '')) : []
+  const covered = (rel) => listed.some((entry) => rel === entry || rel.startsWith(`${entry}/`))
+  const extra = []
+  const walk = (dir, prefix) => {
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${item.name}` : item.name
+      if (item.isDirectory()) {
+        if (item.name === 'node_modules' || item.name === '.git') continue
+        walk(path.join(dir, item.name), rel)
+        continue
+      }
+      if (rel === 'package.json' || covered(rel)) continue
+      extra.push(rel)
+    }
+  }
+  walk(root, '')
+
   line(`插件包：${root}`)
   line(`版本：${pkg.version}  名称：${pkg.name}`)
+  if (extra.length) {
+    line(`提示：${extra.length} 个条目不在 files 白名单里，不会被打进包：`)
+    for (const rel of extra.slice(0, 10)) line(`  - ${rel}`)
+    if (extra.length > 10) line(`  - …另有 ${extra.length - 10} 个`)
+  }
   if (!problems.length) {
     line('校验通过：文件齐全、元数据完整、所有 JS 通过 node --check。')
     line('自测：node test/standalone.test.mjs && node test/render-smoke.mjs')
@@ -156,11 +190,33 @@ function packExtra() {
   const staging = path.join(os.tmpdir(), `dsh-tts-pack-${Date.now()}`)
   const target = path.join(staging, pkg.name)
   fs.mkdirSync(target, { recursive: true })
-  // 只打包该进包的东西：隐藏目录（.tmp 等临时探查文件）一律不进 zip。
-  const skip = new Set(['node_modules', '.git', '.DS_Store', '.tmp'])
-  for (const name of fs.readdirSync(root)) {
-    if (skip.has(name) || name.endsWith('.zip') || name.startsWith('.')) continue
-    fs.cpSync(path.join(root, name), path.join(target, name), { recursive: true })
+
+  // 按 package.json 的 files 白名单拷贝（外加 package.json 本身——files 里通常不列它，
+  // 但装插件必须有）。以前这里只按黑名单跳过 node_modules/.git/.tmp/*.zip，
+  // 于是 *.log / *.bak / _probe* 这类残留会被静默打进发布包，而 --check 只查
+  // 「该有的在不在」，两边都拦不住 —— 干净度就只剩人眼那一道。
+  const listed = Array.isArray(pkg.files) ? pkg.files : []
+  if (!listed.length) {
+    line('打包中止：package.json 没有 files 白名单，无法保证包里没有残留。')
+    fs.rmSync(staging, { recursive: true, force: true })
+    return 1
+  }
+  const missing = []
+  const copy = (rel) => {
+    const from = path.join(root, rel)
+    if (!fs.existsSync(from)) {
+      missing.push(rel)
+      return
+    }
+    fs.cpSync(from, path.join(target, rel), { recursive: true })
+  }
+  for (const rel of listed) copy(rel)
+  if (!listed.includes('package.json')) copy('package.json')
+  if (missing.length) {
+    // 白名单写错的另一种表现：少打了文件，装上去才发现缺东西。
+    line(`打包中止：files 里列了不存在的路径：${missing.join('、')}`)
+    fs.rmSync(staging, { recursive: true, force: true })
+    return 1
   }
 
   const ps = [
@@ -171,13 +227,14 @@ function packExtra() {
     `Compress-Archive -Path '${target}' -DestinationPath '${zipPath}' -CompressionLevel Optimal`,
   ]
   const result = spawnSync(ps[0], ps.slice(1), { encoding: 'utf8' })
+  const packed = countFiles(target)
   fs.rmSync(staging, { recursive: true, force: true })
   if (result.status !== 0) {
     line(`打包失败：${(result.stderr || result.stdout || '').trim()}`)
     return 1
   }
   const bytes = fs.statSync(zipPath).size
-  line(`已打包：${zipPath}（${(bytes / 1024).toFixed(1)} KB）`)
+  line(`已打包：${zipPath}（${(bytes / 1024).toFixed(1)} KB，${packed} 个文件）`)
   line('把这个 zip 解压后，用插件管理器的「从本地安装」选择解压出来的 dsh-plugin-tts 目录。')
   return 0
 }
